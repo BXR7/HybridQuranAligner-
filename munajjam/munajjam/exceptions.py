@@ -96,3 +96,23 @@ class QuranDataError(MunajjamError):
 
     def __init__(self, message: str = "Failed to load Quran reference data.") -> None:
         super().__init__(message)
+
+
+class HybridAlignerError(AlignmentError):
+    """Base error for the opt-in tripartite alignment engine."""
+
+
+class SegmenterError(HybridAlignerError):
+    """Raised when breath segmentation cannot produce validated intervals."""
+
+
+class NoBreathGroupsError(SegmenterError):
+    """Raised when the input is silent or the segmenter returns no groups."""
+
+
+class ModelUnavailableError(HybridAlignerError):
+    """Raised when an optional model/runtime is unavailable or gated."""
+
+
+class InvalidProviderOutputError(HybridAlignerError):
+    """Raised when an injected provider returns malformed evidence."""
