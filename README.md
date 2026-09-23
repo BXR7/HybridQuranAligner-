@@ -172,3 +172,94 @@ See the [examples](./examples) directory for more usage patterns:
 ## License
 
 MIT License - see [LICENSE](./LICENSE) for details.
+
+## Opt-in Tripartite Hybrid Aligner (Issue #120)
+
+Munajjam includes an **experimental, opt-in** alignment engine that combines breath-group
+segmentation, Zipformer reference evidence, and Wav2Vec2 CTC forced alignment.
+
+This engine is **NOT** used by the default `auto` strategy or the server. It must be
+explicitly imported and invoked:
+
+```python
+from munajjam.hybrid_aligner import HybridQuranAligner
+
+aligner = HybridQuranAligner(
+    # inject a logits provider that returns a [frames, vocab] array
+    forced_aligner=Wav2Vec2ForcedAligner(logits_provider=my_ctc_provider),
+)
+result = aligner.align(audio_buffer, targets)
+```
+
+### Architecture
+
+```
+audio
+  ↓
+breath segmentation  (lazy, injectable segmenter boundary)
+  ↓
+reference evidence   (optional, ZipformerNeuralAligner — gated)
+  ↓
+per-breath CTC       (Wav2Vec2ForcedAligner — provider-injected)
+  ↓
+validated final alignment
+```
+
+### Optional model dependencies
+
+The hybrid aligner does **not** import any heavy ML framework at import time. Heavy
+libraries are lazily imported only when a matching provider/backend is explicitly
+constructed:
+
+- **torch** — optional, required only by neural model backends.
+- **transformers** — optional, required only by Transformer-based CTC backends.
+- **whisperx** — optional, used by the legacy server transcription path.
+- **onnxruntime** — optional, for ONNX-based model backends.
+- **sherpa-onnx** — optional, for sherpa-onnx CTC backends.
+- **faster-whisper** — optional, for faster-whisper transcription backends.
+
+`pip install .` does **not** install these. Install them only when you need the
+corresponding neural backend:
+
+```bash
+pip install torch transformers  # for CTC providers
+pip install sherpa-onnx         # for sherpa-onnx backend
+```
+
+### Model access requirements
+
+The `ZipformerNeuralAligner` validates operator-supplied evidence at construction
+time and fails **closed** when evidence is missing or invalid:
+
+- **Repository:** must be `Quran-Lab/zipformer_p-arabic-v3`.
+- **Revision:** must be an immutable 40-character git SHA.
+- **Approval:** must be explicitly set to `True`.
+- **`tokens.txt`:** must contain exactly `vocabulary_size` lines; line
+  `blank_id` (0-indexed) must be the blank token `<blk>`.
+- **Phoneme mapping:** when `phoneme_mapping_required=True`, a `phonemes.txt`
+  mapping file must accompany `tokens.txt`.
+- **License:** the Zipformer model is subject to its upstream license; verify
+  compliance before use.
+
+### Limitations
+
+- The Zipformer reference-aligner integration does **not** auto-download or auto-cache
+  model weights. An operator-supplied backend factory and validated evidence are
+  required.
+- Real-model smoke tests are **opt-in** and require credentials for HuggingFace Hub
+  access to `Quran-Lab/zipformer_p-arabic-v3`.
+- The Wav2Vec2 CTC path supports CPU-only execution; CUDA is never implicitly selected.
+- Post-roll retention is bounded by the next breath group boundary and the audio end.
+- No timestamps are ever synthesized without validated acoustic evidence from the CTC
+  trellis.
+
+### Real-model smoke test instructions
+
+Set `HF_TOKEN` in your environment and run:
+
+```bash
+export HF_TOKEN=your-huggingface-token
+pytest tests/integration/test_zipformer_smoke.py -m "real and not slow" --real-model
+```
+
+Without `HF_TOKEN` or `--real-model`, real-model tests are skipped.

@@ -1,4 +1,5 @@
 """Lazy, fail-closed breath segmentation contracts and adapter."""
+
 from __future__ import annotations
 
 import threading
@@ -35,7 +36,14 @@ class SegmenterConfig:
     max_group_duration_sec: float = 120.0
 
     def __post_init__(self) -> None:
-        values = (self.sample_rate, self.max_duration_sec, self.max_samples, self.max_groups, self.min_group_duration_sec, self.max_group_duration_sec)
+        values = (
+            self.sample_rate,
+            self.max_duration_sec,
+            self.max_samples,
+            self.max_groups,
+            self.min_group_duration_sec,
+            self.max_group_duration_sec,
+        )
         if any(isinstance(v, bool) or float(v) <= 0 for v in values):
             raise ValueError("segmenter limits must be positive")
         if self.min_group_duration_sec > self.max_group_duration_sec:
@@ -45,7 +53,13 @@ class SegmenterConfig:
 class QuranRecitationSegmenter:
     """Segment speech intervals without importing or loading ML runtimes at construction."""
 
-    def __init__(self, config: SegmenterConfig | None = None, *, loader: AudioLoader | None = None, backend_factory: Callable[[], SegmenterBackend] | None = None) -> None:
+    def __init__(
+        self,
+        config: SegmenterConfig | None = None,
+        *,
+        loader: AudioLoader | None = None,
+        backend_factory: Callable[[], SegmenterBackend] | None = None,
+    ) -> None:
         self.config = config or SegmenterConfig()
         self._loader = loader or self._default_loader
         self._backend_factory = backend_factory or self._default_backend
@@ -66,7 +80,9 @@ class QuranRecitationSegmenter:
 
     @staticmethod
     def _default_backend() -> SegmenterBackend:
-        raise ModelUnavailableError("recitation segmenter runtime is optional; inject a backend or install the approved runtime")
+        raise ModelUnavailableError(
+            "recitation segmenter runtime is optional; inject a backend or install the approved runtime"
+        )
 
     def _get_backend(self) -> SegmenterBackend:
         if self._backend is None:
@@ -77,7 +93,9 @@ class QuranRecitationSegmenter:
                     except ModelUnavailableError:
                         raise
                     except Exception as exc:
-                        raise ModelUnavailableError("failed to initialize recitation segmenter") from exc
+                        raise ModelUnavailableError(
+                            "failed to initialize recitation segmenter"
+                        ) from exc
         return self._backend
 
     def segment(self, audio: Any) -> tuple[BreathGroup, ...]:
@@ -89,7 +107,10 @@ class QuranRecitationSegmenter:
             raise SegmenterError("failed to load audio") from exc
         if not np.all(np.isfinite(buffer.samples)):
             raise SegmenterError("audio contains non-finite samples")
-        if len(buffer.samples) > self.config.max_samples or buffer.duration > self.config.max_duration_sec:
+        if (
+            len(buffer.samples) > self.config.max_samples
+            or buffer.duration > self.config.max_duration_sec
+        ):
             raise SegmenterError("audio exceeds segmenter resource limits")
         try:
             raw = self._get_backend()(buffer)
@@ -105,7 +126,9 @@ class QuranRecitationSegmenter:
             raise InvalidProviderOutputError("segmenter returned too many groups")
         for item in raw:
             if not isinstance(item, (tuple, list)) or len(item) not in (2, 3):
-                raise InvalidProviderOutputError("segment interval must contain start, end, and optional score")
+                raise InvalidProviderOutputError(
+                    "segment interval must contain start, end, and optional score"
+                )
             start, end = item[0], item[1]
             score = item[2] if len(item) == 3 else None
             try:
@@ -114,7 +137,10 @@ class QuranRecitationSegmenter:
                 raise InvalidProviderOutputError("segmenter returned an invalid group") from exc
             if group.end > buffer.duration or group.start < previous_end:
                 raise InvalidProviderOutputError("groups must be ordered and inside audio")
-            if group.end - group.start < self.config.min_group_duration_sec or group.end - group.start > self.config.max_group_duration_sec:
+            if (
+                group.end - group.start < self.config.min_group_duration_sec
+                or group.end - group.start > self.config.max_group_duration_sec
+            ):
                 raise InvalidProviderOutputError("group duration violates configured limits")
             groups.append(group)
             previous_end = group.end

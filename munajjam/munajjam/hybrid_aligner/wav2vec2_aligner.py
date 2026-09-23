@@ -1,4 +1,5 @@
 """Constrained CTC forced alignment with no heavyweight import at module load."""
+
 from __future__ import annotations
 
 import math
@@ -31,7 +32,12 @@ class Wav2Vec2Config:
 class Wav2Vec2ForcedAligner:
     """Provider-injected CTC aligner; processor/model construction is deferred."""
 
-    def __init__(self, *, logits_provider: Callable[[np.ndarray, int], np.ndarray] | None = None, config: Wav2Vec2Config | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        logits_provider: Callable[[np.ndarray, int], np.ndarray] | None = None,
+        config: Wav2Vec2Config | None = None,
+    ) -> None:
         self.config = config or Wav2Vec2Config()
         self._provider_factory = logits_provider
         self._provider: Callable[[np.ndarray, int], np.ndarray] | None = None
@@ -42,22 +48,42 @@ class Wav2Vec2ForcedAligner:
             with self._lock:
                 if self._provider is None:
                     if self._provider_factory is None:
-                        raise ModelUnavailableError("Wav2Vec2 runtime is optional; inject a logits provider")
+                        raise ModelUnavailableError(
+                            "Wav2Vec2 runtime is optional; inject a logits provider"
+                        )
                     self._provider = self._provider_factory
         return self._provider
 
+    def close(self) -> None:
+        """Release any cached provider references."""
+        self._provider_factory = None
+        self._provider = None
+
     @staticmethod
     def _log_softmax(logits: np.ndarray) -> np.ndarray:
-        if logits.ndim != 2 or logits.shape[0] == 0 or logits.shape[1] == 0 or not np.all(np.isfinite(logits)):
-            raise InvalidProviderOutputError("logits must be finite with shape [frames, vocabulary]")
+        if (
+            logits.ndim != 2
+            or logits.shape[0] == 0
+            or logits.shape[1] == 0
+            or not np.all(np.isfinite(logits))
+        ):
+            raise InvalidProviderOutputError(
+                "logits must be finite with shape [frames, vocabulary]"
+            )
         shifted = logits - np.max(logits, axis=1, keepdims=True)
         return shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
 
     def _ctc(self, log_probs: np.ndarray, tokens: Sequence[int]) -> list[tuple[int, int, float]]:
         frames, vocab = log_probs.shape
-        if len(tokens) == 0 or len(tokens) > self.config.max_tokens or frames > self.config.max_frames:
+        if (
+            len(tokens) == 0
+            or len(tokens) > self.config.max_tokens
+            or frames > self.config.max_frames
+        ):
             raise AlignmentError("CTC input exceeds valid token/frame limits")
-        if self.config.blank_id >= vocab or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 or t >= vocab for t in tokens):
+        if self.config.blank_id >= vocab or any(
+            isinstance(t, bool) or not isinstance(t, int) or t < 0 or t >= vocab for t in tokens
+        ):
             raise InvalidProviderOutputError("CTC token is outside logits vocabulary")
         extended = [self.config.blank_id]
         for token in tokens:
@@ -81,7 +107,9 @@ class Wav2Vec2ForcedAligner:
                 if math.isfinite(float(best)):
                     score[t, s] = best + log_probs[t, token]
                     back[t, s] = prev
-        end_state = states - 1 if score[-1, states - 1] >= score[-1, max(0, states - 2)] else states - 2
+        end_state = (
+            states - 1 if score[-1, states - 1] >= score[-1, max(0, states - 2)] else states - 2
+        )
         if not math.isfinite(float(score[-1, end_state])):
             raise AlignmentError("CTC target cannot be aligned in this breath group")
         path: list[tuple[int, int, float]] = []
@@ -103,7 +131,15 @@ class Wav2Vec2ForcedAligner:
                 grouped.append((token, frame, prob))
         return grouped
 
-    def align_group(self, audio: AudioBuffer, group: BreathGroup, token_ids: Sequence[int], token_texts: Sequence[str], *, next_group_start: float | None = None) -> tuple[AlignmentSpan, ...]:
+    def align_group(
+        self,
+        audio: AudioBuffer,
+        group: BreathGroup,
+        token_ids: Sequence[int],
+        token_texts: Sequence[str],
+        *,
+        next_group_start: float | None = None,
+    ) -> tuple[AlignmentSpan, ...]:
         if audio.sample_rate <= 0 or group.end > audio.duration:
             raise InvalidProviderOutputError("invalid audio or breath bounds")
         if len(token_ids) != len(token_texts) or not token_ids:
@@ -120,6 +156,7 @@ class Wav2Vec2ForcedAligner:
         path = self._ctc(log_probs, token_ids)
         frame_count = log_probs.shape[0]
         spans: list[AlignmentSpan] = []
+        target_idx = 0
         for index, (token, frame, probability) in enumerate(path):
             end_frame = path[index + 1][1] if index + 1 < len(path) else frame + 1
             start = group.start + frame / frame_count * (upper - group.start)
@@ -127,5 +164,16 @@ class Wav2Vec2ForcedAligner:
             start, end = max(group.start, start), min(upper, end)
             if not math.isfinite(start) or not math.isfinite(end) or end <= start:
                 raise InvalidProviderOutputError("invalid CTC frame conversion")
-            spans.append(AlignmentSpan(token_texts[token_ids.index(token)], start, end, probability, "wav2vec2-ctc"))
+            if token == self.config.blank_id:
+                continue
+            if target_idx >= len(token_ids) or token != token_ids[target_idx]:
+                raise InvalidProviderOutputError(
+                    "CTC path token does not match expected target sequence"
+                )
+            spans.append(
+                AlignmentSpan(token_texts[target_idx], start, end, probability, "wav2vec2-ctc")
+            )
+            target_idx += 1
+        if target_idx != len(token_ids):
+            raise InvalidProviderOutputError("CTC path does not cover all target tokens")
         return tuple(spans)

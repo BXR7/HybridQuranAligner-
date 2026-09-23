@@ -1,4 +1,5 @@
 """Backend-neutral contracts for the opt-in tripartite Quran aligner."""
+
 from __future__ import annotations
 
 import math
@@ -9,7 +10,11 @@ from munajjam.exceptions import AlignmentError
 
 
 def _finite(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
         raise ValueError(f"{name} must be a finite number")
     return float(value)
 
@@ -20,7 +25,11 @@ class AudioBuffer:
     sample_rate: int
 
     def __post_init__(self) -> None:
-        if isinstance(self.sample_rate, bool) or not isinstance(self.sample_rate, int) or self.sample_rate <= 0:
+        if (
+            isinstance(self.sample_rate, bool)
+            or not isinstance(self.sample_rate, int)
+            or self.sample_rate <= 0
+        ):
             raise ValueError("sample_rate must be a positive integer")
         if getattr(self.samples, "ndim", 1) != 1:
             raise ValueError("audio samples must be a one-dimensional mono array")
@@ -42,7 +51,9 @@ class BreathGroup:
         start, end = _finite(self.start, "start"), _finite(self.end, "end")
         if start < 0 or end <= start:
             raise ValueError("BreathGroup must satisfy 0 <= start < end")
-        if self.score is not None and (not math.isfinite(float(self.score)) or not 0 <= float(self.score) <= 1):
+        if self.score is not None and (
+            not math.isfinite(float(self.score)) or not 0 <= float(self.score) <= 1
+        ):
             raise ValueError("score must be between 0 and 1")
 
 
@@ -73,7 +84,11 @@ class PhonemeEmission:
     score: float
 
     def __post_init__(self) -> None:
-        for name, value in (("token_id", self.token_id), ("start_frame", self.start_frame), ("end_frame", self.end_frame)):
+        for name, value in (
+            ("token_id", self.token_id),
+            ("start_frame", self.start_frame),
+            ("end_frame", self.end_frame),
+        ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"{name} must be an integer")
         if self.token_id < 0 or self.start_frame < 0 or self.end_frame <= self.start_frame:
