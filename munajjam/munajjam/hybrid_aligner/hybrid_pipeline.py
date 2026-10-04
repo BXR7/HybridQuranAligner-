@@ -5,11 +5,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from munajjam.exceptions import InvalidProviderOutputError
-from munajjam.hybrid_aligner.neural_aligner import ZipformerNeuralAligner
-from munajjam.hybrid_aligner.recitation_segmenter import QuranRecitationSegmenter
+from munajjam.exceptions import InvalidProviderOutputError, ModelUnavailableError
+from munajjam.hybrid_aligner.model_manager import ModelManager, ModelSpec
+from munajjam.hybrid_aligner.neural_aligner import ZipformerEvidence, ZipformerNeuralAligner
+from munajjam.hybrid_aligner.recitation_segmenter import (
+    EnergyBreathSegmenter,
+    QuranRecitationSegmenter,
+)
 from munajjam.hybrid_aligner.types import AlignmentSpan, AudioBuffer, HybridAlignmentResult
-from munajjam.hybrid_aligner.wav2vec2_aligner import Wav2Vec2ForcedAligner
+from munajjam.hybrid_aligner.wav2vec2_aligner import (
+    TransformersWav2Vec2LogitsProvider,
+    Wav2Vec2ForcedAligner,
+    load_audio_file,
+)
 
 
 class HybridQuranAligner:
@@ -25,6 +33,52 @@ class HybridQuranAligner:
         self.segmenter = segmenter or QuranRecitationSegmenter()
         self.reference_aligner = reference_aligner
         self.forced_aligner = forced_aligner or Wav2Vec2ForcedAligner()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        *,
+        zipformer_evidence: ZipformerEvidence,
+        zipformer_backend_factory: Any,
+        cache_dir: str | None = None,
+        device: str | None = None,
+        allow_download: bool = True,
+    ) -> HybridQuranAligner:
+        """Construct only a fully specified real runtime; never install mocks.
+
+        The Zipformer backend factory is deliberately required because its
+        gated artifact's executable interface must be supplied by the verified
+        artifact runtime. Missing access therefore fails closed.
+        """
+        if zipformer_backend_factory is None:
+            raise ModelUnavailableError("a verified Zipformer backend is required")
+        manager = ModelManager(cache_dir)
+        # The manager validates metadata and caches the exact artifact set. It
+        # never fabricates an ONNX interface from filenames.
+        manager.resolve(
+            ModelSpec(
+                repository=zipformer_evidence.repository,
+                revision=zipformer_evidence.revision,
+                files=(
+                    "config.json",
+                    "tokens.txt",
+                    "phoneme_units.json",
+                    "ordered_quran_phonemes.json",
+                ),
+            ),
+            allow_download=allow_download,
+        )
+        segmenter = QuranRecitationSegmenter(
+            loader=lambda audio, rate: load_audio_file(audio, rate),
+            backend_factory=lambda: EnergyBreathSegmenter(),
+        )
+        reference = ZipformerNeuralAligner(
+            zipformer_evidence,
+            backend_factory=zipformer_backend_factory,
+        )
+        provider = TransformersWav2Vec2LogitsProvider(device=device, cache_dir=cache_dir)
+        forced = Wav2Vec2ForcedAligner(logits_provider=provider)
+        return cls(segmenter=segmenter, reference_aligner=reference, forced_aligner=forced)
 
     def align(
         self, audio: Any, targets: Sequence[tuple[Sequence[int], Sequence[str]]]

@@ -26,6 +26,55 @@ class SegmenterBackend(Protocol):
     def __call__(self, audio: AudioBuffer) -> list[tuple[float, float, float | None]]: ...
 
 
+class EnergyBreathSegmenter:
+    """Deterministic RMS-energy segmentation for real recitation audio.
+
+    This is intentionally a signal-processing backend, not a neural-model
+    claim. It finds contiguous voiced regions separated by minimum pauses.
+    """
+
+    def __init__(
+        self, *, frame_ms: float = 25.0, min_pause_ms: float = 250.0, threshold_db: float = -25.0
+    ) -> None:
+        self.frame_ms = frame_ms
+        self.min_pause_ms = min_pause_ms
+        self.threshold_db = threshold_db
+
+    def __call__(self, audio: AudioBuffer) -> list[tuple[float, float, float | None]]:
+        frame = max(1, round(audio.sample_rate * self.frame_ms / 1000.0))
+        samples = np.asarray(audio.samples, dtype=np.float32)
+        count = max(1, int(np.ceil(len(samples) / frame)))
+        rms = np.array(
+            [
+                float(
+                    np.sqrt(
+                        np.mean(np.square(samples[i * frame : min(len(samples), (i + 1) * frame)]))
+                    )
+                )
+                for i in range(count)
+            ]
+        )
+        db = 20.0 * np.log10(np.maximum(rms, 1e-8))
+        voiced = db >= self.threshold_db
+        pause_frames = max(1, round(self.min_pause_ms / self.frame_ms))
+        boundaries = np.flatnonzero(voiced)
+        if boundaries.size == 0:
+            return []
+        groups: list[tuple[float, float, float | None]] = []
+        start = int(boundaries[0])
+        previous = start
+        for index in boundaries[1:]:
+            index = int(index)
+            if index - previous >= pause_frames:
+                end = min(len(samples), (previous + 1) * frame)
+                groups.append((start * frame / audio.sample_rate, end / audio.sample_rate, None))
+                start = index
+            previous = index
+        end = min(len(samples), (previous + 1) * frame)
+        groups.append((start * frame / audio.sample_rate, end / audio.sample_rate, None))
+        return groups
+
+
 @dataclass(frozen=True, slots=True)
 class SegmenterConfig:
     sample_rate: int = 16_000

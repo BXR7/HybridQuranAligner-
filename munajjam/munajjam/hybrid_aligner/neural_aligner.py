@@ -35,7 +35,7 @@ class ZipformerEvidence:
     Requirements:
         - ``tokens.txt`` must contain exactly ``vocabulary_size`` lines, one
           token per line.  Line ``blank_id`` (0-indexed) must be the blank
-          token ``<blk>``.
+          token ``<blank>``.
         - When ``phoneme_mapping_required`` is ``True`, a ``phonemes.txt``
           mapping file must accompany ``tokens.txt`` and map each token to its
           IPA phoneme.  The mapping must not cross breath boundaries.
