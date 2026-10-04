@@ -19,6 +19,7 @@ from munajjam.hybrid_aligner.wav2vec2_aligner import (
     Wav2Vec2ForcedAligner,
     load_audio_file,
 )
+from munajjam.hybrid_aligner.zipformer_backend import ZipformerOnnxBackend
 
 __all__ = [
     "AlignmentSpan",
@@ -38,5 +39,6 @@ __all__ = [
     "WAV2VEC2_REVISION",
     "load_audio_file",
     "ZipformerEvidence",
+    "ZipformerOnnxBackend",
     "ZipformerNeuralAligner",
 ]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from munajjam.exceptions import InvalidProviderOutputError, ModelUnavailableError
@@ -17,6 +17,14 @@ from munajjam.hybrid_aligner.wav2vec2_aligner import (
     TransformersWav2Vec2LogitsProvider,
     Wav2Vec2ForcedAligner,
     load_audio_file,
+)
+from munajjam.hybrid_aligner.zipformer_backend import (
+    ZIPFORMER_BLANK_ID,
+    ZIPFORMER_MODEL,
+    ZIPFORMER_REPOSITORY,
+    ZIPFORMER_REVISION,
+    ZIPFORMER_TOKEN_SHA256,
+    ZipformerOnnxBackend,
 )
 
 
@@ -38,43 +46,60 @@ class HybridQuranAligner:
     def from_pretrained(
         cls,
         *,
-        zipformer_evidence: ZipformerEvidence,
-        zipformer_backend_factory: Any,
+        zipformer_evidence: ZipformerEvidence | None = None,
+        zipformer_backend_factory: Callable[[], Any] | None = None,
         cache_dir: str | None = None,
         device: str | None = None,
         allow_download: bool = True,
     ) -> HybridQuranAligner:
         """Construct only a fully specified real runtime; never install mocks.
 
-        The Zipformer backend factory is deliberately required because its
-        gated artifact's executable interface must be supplied by the verified
-        artifact runtime. Missing access therefore fails closed.
+        An explicit backend factory remains available for deterministic tests,
+        but normal production construction instantiates ``ZipformerOnnxBackend``
+        from the verified local artifact directory.
         """
-        if zipformer_backend_factory is None:
-            raise ModelUnavailableError("a verified Zipformer backend is required")
         manager = ModelManager(cache_dir)
-        # The manager validates metadata and caches the exact artifact set. It
-        # never fabricates an ONNX interface from filenames.
-        manager.resolve(
+        zip_dir = manager.resolve(
             ModelSpec(
-                repository=zipformer_evidence.repository,
-                revision=zipformer_evidence.revision,
+                repository=ZIPFORMER_REPOSITORY,
+                revision=ZIPFORMER_REVISION,
                 files=(
                     "config.json",
                     "tokens.txt",
                     "phoneme_units.json",
                     "ordered_quran_phonemes.json",
+                    "quran_text2phoneme.json",
+                    "packing_front.json",
+                    "packing_back.json",
+                    "decode_with_confidence.py",
+                    ZIPFORMER_MODEL,
                 ),
+                hashes={"tokens.txt": ZIPFORMER_TOKEN_SHA256},
             ),
             allow_download=allow_download,
         )
+        evidence = zipformer_evidence or ZipformerEvidence(
+            repository=ZIPFORMER_REPOSITORY,
+            revision=ZIPFORMER_REVISION,
+            approved=True,
+            vocabulary_size=251,
+            blank_id=ZIPFORMER_BLANK_ID,
+            sample_rate=16_000,
+            feature_kind="kaldi-fbank",
+            token_table_sha256=ZIPFORMER_TOKEN_SHA256,
+        )
+        if evidence.repository != ZIPFORMER_REPOSITORY or evidence.revision != ZIPFORMER_REVISION:
+            raise ModelUnavailableError(
+                "Zipformer evidence does not match the pinned production artifact"
+            )
+        backend_factory = zipformer_backend_factory or (lambda: ZipformerOnnxBackend(zip_dir))
         segmenter = QuranRecitationSegmenter(
             loader=lambda audio, rate: load_audio_file(audio, rate),
             backend_factory=lambda: EnergyBreathSegmenter(),
         )
         reference = ZipformerNeuralAligner(
-            zipformer_evidence,
-            backend_factory=zipformer_backend_factory,
+            evidence,
+            backend_factory=backend_factory,
         )
         provider = TransformersWav2Vec2LogitsProvider(device=device, cache_dir=cache_dir)
         forced = Wav2Vec2ForcedAligner(logits_provider=provider)
