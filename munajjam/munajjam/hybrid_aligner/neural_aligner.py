@@ -33,9 +33,9 @@ class ZipformerEvidence:
             required by this artifact. Defaults to ``False``.
 
     Requirements:
-        - ``tokens.txt`` must contain exactly ``vocabulary_size`` lines, one
-          token per line.  Line ``blank_id`` (0-indexed) must be the blank
-          token ``<blank>``.
+        - ``tokens.txt`` must contain exactly ``vocabulary_size`` ``piece id``
+          entries.  Entries are parsed by their explicit integer ID rather
+          than line position; the artifact includes ``<blank> 250``.
         - When ``phoneme_mapping_required`` is ``True`, a ``phonemes.txt``
           mapping file must accompany ``tokens.txt`` and map each token to its
           IPA phoneme.  The mapping must not cross breath boundaries.

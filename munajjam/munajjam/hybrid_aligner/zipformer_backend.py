@@ -7,6 +7,7 @@ actual graph. Optional dependencies are imported only when the backend loads.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -52,6 +53,8 @@ class ZipformerOnnxBackend:
         self._config = self._read_json("config.json")
         self._session = session or self._load_session(self.artifact_dir / model_name)
         self._x_input = self._find_acoustic_input()
+        self._processed_input, self._processed_output = self._find_processed_lens()
+        self._state_output_names: dict[str, str] = {}
         self._state_inputs = self._find_state_inputs()
         self._state_outputs = self._find_state_outputs()
         if set(self._state_inputs) != set(self._state_outputs):
@@ -73,17 +76,35 @@ class ZipformerOnnxBackend:
     def _read_tokens(self) -> list[str]:
         path = self.artifact_dir / "tokens.txt"
         try:
-            tokens = [line.rstrip("\n\r") for line in path.read_text(encoding="utf-8").splitlines()]
+            tokens = self._parse_token_table(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise ModelUnavailableError("unable to read Zipformer tokens.txt") from exc
-        import hashlib
-
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != ZIPFORMER_TOKEN_SHA256:
             raise ModelUnavailableError(
                 "Zipformer tokens.txt SHA-256 does not match the pinned artifact"
             )
         return tokens
+
+    @staticmethod
+    def _parse_token_table(text: str) -> list[str]:
+        """Parse the artifact's ``piece id`` table, independent of line order."""
+        entries: dict[int, str] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                piece, raw_id = line.rsplit(maxsplit=1)
+                token_id = int(raw_id)
+            except (ValueError, TypeError) as exc:
+                raise ModelUnavailableError("malformed Zipformer token-table line") from exc
+            if token_id < 0 or token_id in entries:
+                raise ModelUnavailableError("Zipformer token IDs must be unique and non-negative")
+            entries[token_id] = piece
+        if sorted(entries) != list(range(len(entries))):
+            raise ModelUnavailableError("Zipformer token IDs must be contiguous from zero")
+        return [entries[index] for index in range(len(entries))]
 
     @staticmethod
     def _load_session(model_path: Path) -> Any:
@@ -101,9 +122,17 @@ class ZipformerOnnxBackend:
     @staticmethod
     def _shape(value: Any) -> tuple[int, ...] | None:
         shape = getattr(value, "shape", None)
-        if not isinstance(shape, (list, tuple)) or any(not isinstance(x, int) for x in shape):
+        if not isinstance(shape, (list, tuple)):
             return None
-        return tuple(shape)
+        result: list[int] = []
+        for dimension in shape:
+            if isinstance(dimension, int) and dimension > 0:
+                result.append(dimension)
+            elif isinstance(dimension, str) and dimension.lower() in {"n", "b", "batch"}:
+                result.append(1)
+            else:
+                return None
+        return tuple(result)
 
     def _find_acoustic_input(self) -> str:
         candidates = []
@@ -117,21 +146,35 @@ class ZipformerOnnxBackend:
             )
         return candidates[0]
 
+    def _find_processed_lens(self) -> tuple[str, str]:
+        inputs = {item.name for item in self._session.get_inputs()}
+        outputs = {item.name for item in self._session.get_outputs()}
+        if "processed_lens" not in inputs:
+            raise ModelUnavailableError("Zipformer graph is missing processed_lens input")
+        output = "new_processed_lens" if "new_processed_lens" in outputs else "processed_lens"
+        if output not in outputs:
+            raise ModelUnavailableError("Zipformer graph is missing processed_lens output")
+        return "processed_lens", output
+
     def _find_state_inputs(self) -> dict[str, Any]:
         outputs = {item.name: item for item in self._session.get_outputs()}
         return {
             item.name: item
             for item in self._session.get_inputs()
-            if item.name != self._x_input and item.name in outputs
+            if item.name not in (self._x_input, "processed_lens")
+            and (item.name in outputs or f"new_{item.name}" in outputs)
         }
 
     def _find_state_outputs(self) -> dict[str, Any]:
-        inputs = {item.name: item for item in self._session.get_inputs()}
-        return {
-            item.name: item
-            for item in self._session.get_outputs()
-            if item.name != self._logit_candidate_name() and item.name in inputs
-        }
+        outputs = {item.name: item for item in self._session.get_outputs()}
+        result: dict[str, Any] = {}
+        for name in self._state_inputs:
+            output_name = name if name in outputs else f"new_{name}"
+            if output_name not in outputs:
+                raise ModelUnavailableError(f"Zipformer state output is missing for {name}")
+            self._state_output_names[name] = output_name
+            result[name] = outputs[output_name]
+        return result
 
     def _logit_candidate_name(self) -> str:
         candidates = []
@@ -150,20 +193,29 @@ class ZipformerOnnxBackend:
 
     @staticmethod
     def _official_feature_extractor(samples: np.ndarray, sample_rate: int) -> np.ndarray:
-        """Use the artifact-authoritative kaldifeat implementation only."""
+        """Compute the artifact's 16 kHz, 80-bin Kaldi/Povey fbank."""
         try:
-            import kaldifeat
+            import kaldi_native_fbank as knf
         except Exception as exc:
             raise ModelUnavailableError(
-                "the verified Zipformer feature runtime (kaldifeat) is unavailable"
+                "Zipformer requires the installable kaldi-native-fbank runtime"
             ) from exc
-        options = kaldifeat.FbankOptions()
-        options.device = "cpu"
-        options.frame_opts.samp_freq = float(sample_rate)
+        if sample_rate != 16_000:
+            raise InvalidProviderOutputError("Zipformer fbank requires 16 kHz audio")
+        options = knf.FbankOptions()
+        options.frame_opts.samp_freq = 16_000
+        options.frame_opts.frame_length_ms = 25.0
+        options.frame_opts.frame_shift_ms = 10.0
         options.mel_opts.num_bins = 80
         options.frame_opts.dither = 0.0
-        features = kaldifeat.Fbank(options, samples.astype(np.float32, copy=False))
-        array = np.asarray(features, dtype=np.float32)
+        options.frame_opts.snip_edges = False
+        options.frame_opts.window_type = "povey"
+        fbank = knf.OnlineFbank(options)
+        # kaldi-native-fbank follows Kaldi's int16-scaled waveform convention.
+        fbank.accept_waveform(sample_rate, (samples.astype(np.float32) * 32768.0).tolist())
+        array = np.asarray(
+            [fbank.get_frame(index) for index in range(fbank.num_frames_ready)], dtype=np.float32
+        )
         if array.ndim != 2 or array.shape[1] != 80:
             raise InvalidProviderOutputError(
                 "Zipformer feature extractor returned a non-[frames,80] tensor"
@@ -178,21 +230,46 @@ class ZipformerOnnxBackend:
                 raise ModelUnavailableError(
                     f"Zipformer state input {name} has dynamic/invalid shape {shape}"
                 )
-            dtype = np.float32 if str(getattr(item, "type", "")).endswith("float") else np.int64
-            state[name] = np.zeros(shape, dtype=dtype)
+            state[name] = np.zeros(shape, dtype=self._numpy_dtype(item))
         return state
 
     @staticmethod
-    def _chunks(features: np.ndarray) -> list[np.ndarray]:
+    def _numpy_dtype(value: Any) -> np.dtype:
+        type_name = str(getattr(value, "type", "")).lower()
+        if "float16" in type_name:
+            return np.dtype(np.float16)
+        if "float" in type_name:
+            return np.dtype(np.float32)
+        if "int32" in type_name:
+            return np.dtype(np.int32)
+        if "int64" in type_name:
+            return np.dtype(np.int64)
+        raise ModelUnavailableError(f"unsupported Zipformer ONNX tensor type: {type_name}")
+
+    def _initial_processed_lens(self) -> np.ndarray:
+        item = next(
+            item for item in self._session.get_inputs() if item.name == self._processed_input
+        )
+        shape = self._shape(item)
+        if shape is None:
+            raise ModelUnavailableError("Zipformer processed_lens has a dynamic shape")
+        return np.zeros(shape, dtype=np.int32)
+
+    @staticmethod
+    def _chunks(
+        features: np.ndarray, *, input_frames: int = 61, decode_chunk_len: int = 48
+    ) -> list[np.ndarray]:
         if features.ndim != 2 or features.shape[1] != 80 or not np.all(np.isfinite(features)):
             raise InvalidProviderOutputError("Zipformer features must be finite [frames,80]")
-        # The verified graph has a fixed 61-frame window. The final chunk is
-        # right-padded with zeros; frame accounting retains the unpadded count.
+        if input_frames <= decode_chunk_len:
+            raise InvalidProviderOutputError(
+                "Zipformer input window must exceed decode chunk length"
+            )
         chunks: list[np.ndarray] = []
-        for start in range(0, len(features), 61):
-            chunk = features[start : start + 61]
-            if len(chunk) < 61:
-                chunk = np.pad(chunk, ((0, 61 - len(chunk)), (0, 0)))
+        for start in range(0, len(features), decode_chunk_len):
+            chunk = features[start : start + input_frames]
+            if len(chunk) < input_frames:
+                chunk = np.pad(chunk, ((0, input_frames - len(chunk)), (0, 0)))
             chunks.append(chunk[None, ...].astype(np.float32, copy=False))
         return chunks
 
@@ -204,13 +281,14 @@ class ZipformerOnnxBackend:
         start = round(group.start * audio.sample_rate)
         end = round(group.end * audio.sample_rate)
         features = self._feature_extractor(np.asarray(audio.samples[start:end]), audio.sample_rate)
-        chunks = self._chunks(features)
+        chunks = self._chunks(features, input_frames=61, decode_chunk_len=48)
         state = self._initial_state()
+        processed_lens = self._initial_processed_lens()
         emissions: list[PhonemeEmission] = []
         frame_offset = 0
         output_names = [item.name for item in self._session.get_outputs()]
         for chunk in chunks:
-            feeds = {self._x_input: chunk, **state}
+            feeds = {self._x_input: chunk, self._processed_input: processed_lens, **state}
             outputs = self._session.run(output_names, feeds)
             by_name = dict(zip(output_names, outputs, strict=True))
             logits = np.asarray(by_name[self._logit_output], dtype=np.float32)
@@ -249,12 +327,18 @@ class ZipformerOnnxBackend:
                         )
                     )
             for name in state:
-                value = np.asarray(by_name[name])
+                value = np.asarray(by_name[self._state_output_names[name]])
                 if value.shape != state[name].shape or not np.all(np.isfinite(value)):
                     raise InvalidProviderOutputError(
                         f"Zipformer state output {name} has invalid shape or values"
                     )
                 state[name] = value
+            processed_value = np.asarray(by_name[self._processed_output])
+            if processed_value.shape != processed_lens.shape or not np.all(
+                np.isfinite(processed_value)
+            ):
+                raise InvalidProviderOutputError("Zipformer processed_lens output is invalid")
+            processed_lens = processed_value.astype(np.int32, copy=False)
             frame_offset += logits.shape[1]
         return emissions
 

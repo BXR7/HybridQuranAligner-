@@ -72,6 +72,8 @@ class HybridQuranAligner:
                     "packing_front.json",
                     "packing_back.json",
                     "decode_with_confidence.py",
+                    "export_quran_streaming_onnx.py",
+                    "quran_per_eval.py",
                     ZIPFORMER_MODEL,
                 ),
                 hashes={"tokens.txt": ZIPFORMER_TOKEN_SHA256},

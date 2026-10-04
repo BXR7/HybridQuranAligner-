@@ -61,8 +61,12 @@ api = [
     "uvicorn>=0.23.0",
     "python-multipart>=0.0.6",
 ]
+zipformer = [
+    "onnxruntime>=1.17.0",
+    "kaldi-native-fbank>=1.22.0",
+]
 all = [
-    "munajjam[dev,api]",
+    "munajjam[dev,api,zipformer]",
 ]
 
 [project.scripts]
