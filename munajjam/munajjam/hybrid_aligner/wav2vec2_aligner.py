@@ -59,6 +59,8 @@ class TransformersWav2Vec2LogitsProvider:
         vocab_size = int(getattr(self.model.config, "vocab_size", -1))
         if vocab_size != WAV2VEC2_VOCABULARY_SIZE:
             raise ModelUnavailableError(f"unexpected Wav2Vec2 vocabulary size: {vocab_size}")
+        if int(getattr(self.model.config, "pad_token_id", -1)) != 0:
+            raise ModelUnavailableError("pinned Wav2Vec2 CTC blank/pad ID must be 0")
         sampling_rate = int(getattr(self.processor.feature_extractor, "sampling_rate", -1))
         if sampling_rate != WAV2VEC2_SAMPLE_RATE:
             raise ModelUnavailableError(f"unexpected Wav2Vec2 sample rate: {sampling_rate}")
@@ -107,6 +109,43 @@ class TransformersWav2Vec2LogitsProvider:
             raise InvalidProviderOutputError("Wav2Vec2 returned malformed logits")
         return logits
 
+    def encode_text(self, text: str) -> tuple[list[int], list[str]]:
+        """Encode canonical Arabic with the pinned tokenizer, without ID bridging."""
+        if not isinstance(text, str) or not text.strip():
+            raise InvalidProviderOutputError("canonical reference text must be non-empty")
+        tokenizer = self.processor.tokenizer
+        try:
+            encoded = tokenizer(text, add_special_tokens=False)
+            token_ids = list(encoded["input_ids"])
+            unk_id = getattr(tokenizer, "unk_token_id", None)
+            if not token_ids or any(token_id == unk_id for token_id in token_ids):
+                raise InvalidProviderOutputError(
+                    "Wav2Vec2 tokenizer produced an empty or unknown canonical reference"
+                )
+            if any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                or token_id >= WAV2VEC2_VOCABULARY_SIZE
+                or token_id == 0
+                for token_id in token_ids
+            ):
+                raise InvalidProviderOutputError(
+                    "Wav2Vec2 tokenizer emitted an invalid or blank target ID"
+                )
+            token_texts = tokenizer.convert_ids_to_tokens(token_ids)
+            if isinstance(token_texts, str):
+                token_texts = [token_texts]
+            if len(token_texts) != len(token_ids) or any(
+                not isinstance(token, str) or not token for token in token_texts
+            ):
+                raise InvalidProviderOutputError("Wav2Vec2 tokenizer returned malformed symbols")
+            return token_ids, list(token_texts)
+        except InvalidProviderOutputError:
+            raise
+        except Exception as exc:
+            raise InvalidProviderOutputError("Wav2Vec2 canonical text tokenization failed") from exc
+
     def close(self) -> None:
         self.model = None
         self.processor = None
@@ -150,11 +189,15 @@ class Wav2Vec2ForcedAligner:
         self,
         *,
         logits_provider: Callable[[np.ndarray, int], np.ndarray] | None = None,
+        logits_provider_factory: Callable[[], Callable[[np.ndarray, int], np.ndarray]]
+        | None = None,
         config: Wav2Vec2Config | None = None,
     ) -> None:
+        if logits_provider is not None and logits_provider_factory is not None:
+            raise ValueError("provide logits_provider or logits_provider_factory, not both")
         self.config = config or Wav2Vec2Config()
-        self._provider_factory = logits_provider
-        self._provider: Callable[[np.ndarray, int], np.ndarray] | None = None
+        self._provider_factory = logits_provider_factory
+        self._provider: Callable[[np.ndarray, int], np.ndarray] | None = logits_provider
         self._lock = threading.Lock()
 
     def _get_provider(self) -> Callable[[np.ndarray, int], np.ndarray]:
@@ -165,8 +208,30 @@ class Wav2Vec2ForcedAligner:
                         raise ModelUnavailableError(
                             "Wav2Vec2 runtime is optional; inject a logits provider"
                         )
-                    self._provider = self._provider_factory
+                    self._provider = self._provider_factory()
         return self._provider
+
+    def encode_text(self, text: str) -> tuple[list[int], list[str]]:
+        """Use the configured provider's tokenizer for a canonical reference."""
+        provider = self._get_provider()
+        encoder = getattr(provider, "encode_text", None)
+        if not callable(encoder):
+            raise ModelUnavailableError(
+                "configured Wav2Vec2 provider does not expose its reference tokenizer"
+            )
+        token_ids, token_texts = encoder(text)
+        if (
+            not token_ids
+            or len(token_ids) != len(token_texts)
+            or any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id == self.config.blank_id
+                for token_id in token_ids
+            )
+        ):
+            raise InvalidProviderOutputError("canonical Wav2Vec2 target tokens are invalid")
+        return list(token_ids), list(token_texts)
 
     def close(self) -> None:
         """Release any cached provider references."""
@@ -190,7 +255,9 @@ class Wav2Vec2ForcedAligner:
         shifted = logits - np.max(logits, axis=1, keepdims=True)
         return shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
 
-    def _ctc(self, log_probs: np.ndarray, tokens: Sequence[int]) -> list[tuple[int, int, float]]:
+    def _ctc(
+        self, log_probs: np.ndarray, tokens: Sequence[int]
+    ) -> list[tuple[int, int, int, float]]:
         frames, vocab = log_probs.shape
         if (
             len(tokens) == 0
@@ -239,13 +306,13 @@ class Wav2Vec2ForcedAligner:
                 if s < 0:
                     raise AlignmentError("invalid CTC backtrace")
         path.reverse()
-        grouped: list[tuple[int, int, float]] = []
+        grouped: list[tuple[int, int, int, float]] = []
         for token, frame, prob in path:
-            if grouped and grouped[-1][0] == token and grouped[-1][1] == frame - 1:
-                old = grouped[-1]
-                grouped[-1] = (token, frame, max(old[2], prob))
+            if grouped and grouped[-1][0] == token and grouped[-1][2] == frame:
+                old_token, start_frame, _, old_prob = grouped[-1]
+                grouped[-1] = (old_token, start_frame, frame + 1, max(old_prob, prob))
             else:
-                grouped.append((token, frame, prob))
+                grouped.append((token, frame, frame + 1, prob))
         return grouped
 
     def align_group(
@@ -274,9 +341,8 @@ class Wav2Vec2ForcedAligner:
         frame_count = log_probs.shape[0]
         spans: list[AlignmentSpan] = []
         target_idx = 0
-        for index, (token, frame, probability) in enumerate(path):
-            end_frame = path[index + 1][1] if index + 1 < len(path) else frame + 1
-            start = group.start + frame / frame_count * (upper - group.start)
+        for token, start_frame, end_frame, probability in path:
+            start = group.start + start_frame / frame_count * (upper - group.start)
             end = group.start + end_frame / frame_count * (upper - group.start)
             start, end = max(group.start, start), min(upper, end)
             if not math.isfinite(start) or not math.isfinite(end) or end <= start:

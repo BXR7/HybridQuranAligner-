@@ -65,6 +65,12 @@ zipformer = [
     "onnxruntime>=1.17.0",
     "kaldi-native-fbank>=1.22.0",
 ]
+segmenter = [
+    "recitations-segmenter==1.0.0",
+    "transformers==4.51.3",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+]
 all = [
     "munajjam[dev,api,zipformer]",
 ]

@@ -60,13 +60,17 @@ def load_ayahs(riwaya: str | None = None) -> list[Ayah]:
             surah_str = str(surah_idx)
             if surah_str in data:
                 for idx, text in enumerate(data[surah_str]):
-                    ayah = Ayah(
-                        id=global_id,
-                        surah_id=surah_idx,
-                        ayah_number=idx + 1,
-                        text=text,
-                    )
-                    ayahs.append(ayah)
+                    # Some bundled Warsh entries are empty placeholders. Keep
+                    # their canonical position and global ID, but never expose
+                    # an empty string as Quran text.
+                    if isinstance(text, str) and text.strip():
+                        ayah = Ayah(
+                            id=global_id,
+                            surah_id=surah_idx,
+                            ayah_number=idx + 1,
+                            text=text,
+                        )
+                        ayahs.append(ayah)
                     global_id += 1
 
         return ayahs

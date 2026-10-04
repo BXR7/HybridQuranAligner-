@@ -178,48 +178,61 @@ MIT License - see [LICENSE](./LICENSE) for details.
 Munajjam includes an **experimental, opt-in** alignment engine that combines breath-group
 segmentation, Zipformer reference evidence, and Wav2Vec2 CTC forced alignment.
 
-This engine is **NOT** used by the default `auto` strategy or the server. It must be
-explicitly imported and invoked:
+This engine is **NOT** used by the default `auto` strategy or the server. The production
+hybrid path is opt-in and accepts explicit canonical verse references for each detected
+breath group:
 
 ```python
-from munajjam.hybrid_aligner import HybridQuranAligner
+from munajjam.hybrid_aligner import CanonicalReferenceRequest, HybridQuranAligner
 
-aligner = HybridQuranAligner(
-    # inject a logits provider that returns a [frames, vocab] array
-    forced_aligner=Wav2Vec2ForcedAligner(logits_provider=my_ctc_provider),
+aligner = HybridQuranAligner.from_pretrained()
+result = aligner.align(
+    audio_buffer,
+    references=[
+        CanonicalReferenceRequest(surah_id=1, ayah_start=1, ayah_end=2, riwaya="hafs"),
+        CanonicalReferenceRequest(surah_id=1, ayah_start=3, ayah_end=7, riwaya="hafs"),
+    ],
 )
-result = aligner.align(audio_buffer, targets)
+aligner.close()
 ```
 
-`targets` is caller-supplied and must contain exactly one `(token_ids, token_texts)` pair
-for each detected breath group. The pipeline fails closed on a count mismatch; it does not
-guess Quran phrase boundaries or automatically assign ayat to breaths.
+The bundled provider supplies exact Hafs/Warsh ayah text and source/content SHA-256
+provenance. There must be exactly one explicit verse-range request per physical breath
+group; no verse assignment is guessed from duration or group count. Legacy token-pair
+inputs remain available to explicitly injected test/custom pipelines, but production
+construction rejects them. Wav2Vec2 targets come from its pinned tokenizer, not by
+translating Zipformer's numeric IDs.
+
+Basmalah is included only when explicitly requested and is sourced from the selected
+riwaya's bundled ayah 1:1 (without duplicating Fatiha 1:1). Isti'adhah is not in the
+bundled ayah data: requesting it requires an explicit `VerifiedSpecialPhrase` with a
+source and matching SHA-256. Empty Warsh placeholders remain unavailable and fail closed.
 
 ### Architecture
 
 ```
 audio
   ↓
-breath segmentation  (signal-processing segmenter; group count is not fixed)
+breath segmentation  (pinned obadx/recitation-segmenter-v2 model; group count varies)
   ↓
-Zipformer reference evidence (gated, per-breath)
+canonical Quran reference (explicit verse ranges, per-breath, provenance-bearing)
   ↓
-per-breath CTC       (Wav2Vec2ForcedAligner — provider-injected)
+Zipformer phoneme emissions (pinned, gated artifact; currently not text-aligned)
+  ↓
+per-breath CTC       (Wav2Vec2 tokenizer + constrained trellis)
   ↓
 validated final alignment
 ```
 
 The upstream [Issue #120 acceptance criteria](https://github.com/Itqan-community/Munajjam/issues/120)
-describe Zipformer as the **reference phoneme-alignment stage** (including canonical
-reference text and Isti'adhah/Basmalah identification), followed by Wav2Vec2 microscopic
-forced alignment. The issue does not prescribe an evidence-fusion algorithm or a mapping
-between the 251-symbol Zipformer vocabulary and Wav2Vec2's 51-symbol vocabulary. Therefore
-this implementation retains Zipformer's validated per-breath emissions as explicit
-reference-phoneme evidence in result metadata, but does not claim that those emissions
-are fused into final spans. The two token spaces are never mapped or interchanged. This
-preserves the supported stage boundary without inventing fusion semantics; canonical
-text matching and Isti'adhah/Basmalah identification remain unimplemented until their
-authoritative mapping/decision contract is available.
+describe Zipformer as the **reference phoneme-alignment stage**, followed by Wav2Vec2
+microscopic forced alignment. The gated pinned artifact documents
+`quran_text2phoneme.json` and `ordered_quran_phonemes.json` as canonical phoneme resources,
+but their payload/schema is not accessible in this environment. Results therefore mark
+Zipformer emissions as **unaligned evidence** and expose a blocker in metadata; they do
+not claim canonical Zipformer alignment or evidence fusion. No mapping between the
+251-symbol Zipformer and 51-symbol Wav2Vec2 vocabularies is inferred. The exact remaining
+artifact requirements are recorded in [`docs/issue_120_external_sources.md`](docs/issue_120_external_sources.md).
 
 For the pinned Zipformer model card at revision
 `506422c82a81c86e7ae74a5a2ab4641724bcd3b3`, the documented streaming grid is a 61-frame
@@ -244,10 +257,11 @@ constructed:
 - **faster-whisper** — optional, for faster-whisper transcription backends.
 
 `pip install .` does **not** install these. Install them only when you need the
-corresponding neural backend:
+`pip install .` does **not** install neural runtimes. Install the pinned production
+segmenter/Wav2Vec2 dependencies and Zipformer runtime only when needed:
 
 ```bash
-pip install torch transformers  # for CTC providers
+pip install 'munajjam[segmenter,zipformer]'
 pip install sherpa-onnx         # for sherpa-onnx backend
 cd munajjam && pip install '.[zipformer]'  # ONNX Runtime + Kaldi native fbank
 ```

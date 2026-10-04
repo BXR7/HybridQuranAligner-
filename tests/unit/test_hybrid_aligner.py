@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+
 from munajjam.exceptions import (
     AlignmentError,
     InvalidProviderOutputError,
@@ -29,11 +30,14 @@ from munajjam.hybrid_aligner import (
     AlignmentSpan,
     AudioBuffer,
     BreathGroup,
+    CanonicalQuranReferenceProvider,
+    CanonicalReferenceRequest,
     HybridAlignmentResult,
     HybridQuranAligner,
     PhonemeEmission,
     QuranRecitationSegmenter,
     SegmenterConfig,
+    TransformersRecitationSegmenterBackend,
     Wav2Vec2Config,
     Wav2Vec2ForcedAligner,
     ZipformerEvidence,
@@ -102,7 +106,11 @@ class _FakeZipformerBackend:
 def valid_zipformer_aligner(emissions=None, backend_factory=None):
     if backend_factory is None:
         emissions = emissions or []
-        backend_factory = lambda: _FakeZipformerBackend(emissions)
+
+        def make_backend():
+            return _FakeZipformerBackend(emissions)
+
+        backend_factory = make_backend
     return ZipformerNeuralAligner(make_evidence(), backend_factory=backend_factory)
 
 
@@ -140,7 +148,7 @@ def _aligned_logits(frames, blank_id, tokens):
     n = len(tokens)
     per = max(1, frames // (n + 1))
     offset = per
-    for i, tok in enumerate(tokens):
+    for tok in tokens:
         logits[offset : offset + per, tok] = 10.0
         offset += per
     return logits
@@ -342,9 +350,7 @@ class TestSegmenterResourceLimits:
         )
         with pytest.raises(SegmenterError):
             seg.segment(audio(1.0))
-        assert calls[0] == 0, (
-            "backend must not be allocated when duration exceeds limit"
-        )
+        assert calls[0] == 0, "backend must not be allocated when duration exceeds limit"
 
     def test_sample_count_limit_prevents_backend_allocation(self):
         calls = [0]
@@ -441,10 +447,11 @@ class TestSegmenterInjection:
         assert called[0]
         assert isinstance(buf, AudioBuffer)
 
-    def test_default_backend_raises_model_unavailable(self):
+    def test_default_backend_is_pinned_and_lazy(self):
         seg = QuranRecitationSegmenter()
-        with pytest.raises(ModelUnavailableError):
-            seg._get_backend()
+        backend = seg._get_backend()
+        assert isinstance(backend, TransformersRecitationSegmenterBackend)
+        assert backend._runtime is None
 
 
 class _SilentBackend:
@@ -563,9 +570,7 @@ class TestZipformerProvider:
 
     def test_close_unload(self):
         aligner = valid_zipformer_aligner(
-            emissions=[
-                PhonemeEmission(token_id=1, start_frame=0, end_frame=5, score=0.9)
-            ]
+            emissions=[PhonemeEmission(token_id=1, start_frame=0, end_frame=5, score=0.9)]
         )
         aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
         aligner.close()
@@ -583,9 +588,7 @@ class TestZipformerProvider:
 
     def test_align_rejects_non_phoneme_emission(self):
         backend = _FakeZipformerBackend([object()])
-        aligner = ZipformerNeuralAligner(
-            make_evidence(), backend_factory=lambda: backend
-        )
+        aligner = ZipformerNeuralAligner(make_evidence(), backend_factory=lambda: backend)
         with pytest.raises(InvalidProviderOutputError):
             aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
 
@@ -593,9 +596,7 @@ class TestZipformerProvider:
         backend = _FakeZipformerBackend(
             [PhonemeEmission(token_id=300, start_frame=0, end_frame=1, score=0.9)]
         )
-        aligner = ZipformerNeuralAligner(
-            make_evidence(), backend_factory=lambda: backend
-        )
+        aligner = ZipformerNeuralAligner(make_evidence(), backend_factory=lambda: backend)
         with pytest.raises(InvalidProviderOutputError):
             aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
 
@@ -603,9 +604,7 @@ class TestZipformerProvider:
         backend = _FakeZipformerBackend(
             [PhonemeEmission(token_id=250, start_frame=0, end_frame=1, score=0.9)]
         )
-        aligner = ZipformerNeuralAligner(
-            make_evidence(), backend_factory=lambda: backend
-        )
+        aligner = ZipformerNeuralAligner(make_evidence(), backend_factory=lambda: backend)
         with pytest.raises(InvalidProviderOutputError):
             aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
 
@@ -616,9 +615,7 @@ class TestZipformerProvider:
                 PhonemeEmission(token_id=2, start_frame=3, end_frame=8, score=0.9),
             ]
         )
-        aligner = ZipformerNeuralAligner(
-            make_evidence(), backend_factory=lambda: backend
-        )
+        aligner = ZipformerNeuralAligner(make_evidence(), backend_factory=lambda: backend)
         with pytest.raises(InvalidProviderOutputError):
             aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
 
@@ -648,9 +645,7 @@ class TestZipformerProvider:
         backend = _FakeZipformerBackend(
             [PhonemeEmission(token_id=1, start_frame=0, end_frame=10, score=0.95)]
         )
-        aligner = ZipformerNeuralAligner(
-            make_evidence(), backend_factory=lambda: backend
-        )
+        aligner = ZipformerNeuralAligner(make_evidence(), backend_factory=lambda: backend)
         result = aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
         assert len(result) == 1
 
@@ -671,9 +666,7 @@ class TestZipformerProvider:
             def close(self):
                 pass
 
-        aligner = ZipformerNeuralAligner(
-            make_evidence(), backend_factory=lambda: FailingBackend()
-        )
+        aligner = ZipformerNeuralAligner(make_evidence(), backend_factory=lambda: FailingBackend())
         with pytest.raises(RuntimeError, match="backend crashed"):
             aligner.align(audio(1.0), BreathGroup(0.0, 0.5))
 
@@ -775,9 +768,7 @@ class TestWav2Vec2CTC:
             logits_provider=make_logits_provider(_aligned_logits(16, 0, [1, 2])),
             config=Wav2Vec2Config(blank_id=0, max_frames=100, max_tokens=100),
         )
-        spans = aligner.align_group(
-            audio(1.0), BreathGroup(0.1, 0.5), [1, 2], ["a", "b"]
-        )
+        spans = aligner.align_group(audio(1.0), BreathGroup(0.1, 0.5), [1, 2], ["a", "b"])
         assert len(spans) == 2
         assert spans[0].token == "a"
         assert spans[1].token == "b"
@@ -788,9 +779,7 @@ class TestWav2Vec2CTC:
             logits_provider=make_logits_provider(_aligned_logits(16, 0, [1, 1])),
             config=Wav2Vec2Config(blank_id=0, max_frames=100, max_tokens=100),
         )
-        spans = aligner.align_group(
-            audio(1.0), BreathGroup(0.1, 0.5), [1, 1], ["a", "b"]
-        )
+        spans = aligner.align_group(audio(1.0), BreathGroup(0.1, 0.5), [1, 1], ["a", "b"])
         assert len(spans) == 2
         assert spans[0].token == "a"
         assert spans[1].token == "b"
@@ -798,9 +787,7 @@ class TestWav2Vec2CTC:
     def test_impossible_target_raises(self):
         """A single frame cannot align two tokens → AlignmentError."""
         aligner = make_wav2vec_aligner(
-            logits_provider=make_logits_provider(
-                np.full((1, 3), 1.0, dtype=np.float32)
-            ),
+            logits_provider=make_logits_provider(np.full((1, 3), 1.0, dtype=np.float32)),
             config=Wav2Vec2Config(blank_id=0, max_frames=100, max_tokens=100),
         )
         with pytest.raises(AlignmentError):
@@ -809,9 +796,7 @@ class TestWav2Vec2CTC:
     def test_impossible_target_no_guessed_timestamps(self):
         """Impossible alignment must not produce guessed timestamps."""
         aligner = make_wav2vec_aligner(
-            logits_provider=make_logits_provider(
-                np.full((1, 3), 1.0, dtype=np.float32)
-            ),
+            logits_provider=make_logits_provider(np.full((1, 3), 1.0, dtype=np.float32)),
         )
         with pytest.raises((AlignmentError, InvalidProviderOutputError)):
             aligner.align_group(audio(1.0), BreathGroup(0.1, 0.5), [1, 2], ["a", "b"])
@@ -912,6 +897,21 @@ class TestWav2Vec2FrameConversion:
         assert captured[0] == 16
         assert len(spans) == 2
 
+    def test_token_span_preserves_all_consecutive_ctc_frames(self):
+        """A token's timing spans its full CTC run, not only its final frame."""
+        logits = np.full((20, 2), -2.0, dtype=np.float32)
+        logits[:, 0] = 0.0
+        logits[5:12, 1] = 8.0
+        aligner = make_wav2vec_aligner(
+            logits_provider=make_logits_provider(logits),
+            config=Wav2Vec2Config(blank_id=0, max_frames=100, max_tokens=100),
+        )
+        spans = aligner.align_group(audio(1.0), BreathGroup(0.1, 0.5), [1], ["a"])
+        assert len(spans) == 1
+        assert spans[0].start == pytest.approx(0.25)
+        assert spans[0].end == pytest.approx(0.46)
+        assert spans[0].end - spans[0].start > 0.2
+
 
 class TestWav2Vec2PostRoll:
     def test_post_roll_positive(self):
@@ -924,9 +924,7 @@ class TestWav2Vec2PostRoll:
         """Post-roll beyond audio end must be clipped to audio duration."""
         aligner = make_wav2vec_aligner(
             logits_provider=make_logits_provider(_aligned_logits(8, 0, [1, 2])),
-            config=Wav2Vec2Config(
-                blank_id=0, post_roll_sec=10.0, max_frames=1000, max_tokens=1000
-            ),
+            config=Wav2Vec2Config(blank_id=0, post_roll_sec=10.0, max_frames=1000, max_tokens=1000),
         )
         buf = audio(1.0)
         spans = aligner.align_group(
@@ -942,9 +940,7 @@ class TestWav2Vec2PostRoll:
         """Post-roll must not extend into the next breath group."""
         aligner = make_wav2vec_aligner(
             logits_provider=make_logits_provider(_aligned_logits(32, 0, [1, 2])),
-            config=Wav2Vec2Config(
-                blank_id=0, post_roll_sec=10.0, max_frames=1000, max_tokens=1000
-            ),
+            config=Wav2Vec2Config(blank_id=0, post_roll_sec=10.0, max_frames=1000, max_tokens=1000),
         )
         buf = audio(5.0)
         next_start = 1.0
@@ -962,9 +958,7 @@ class TestWav2Vec2PostRoll:
         """Trailing phonetic decay may be retained inside post-roll window."""
         aligner = make_wav2vec_aligner(
             logits_provider=make_logits_provider(_aligned_logits(32, 0, [1, 2])),
-            config=Wav2Vec2Config(
-                blank_id=0, post_roll_sec=0.5, max_frames=1000, max_tokens=1000
-            ),
+            config=Wav2Vec2Config(blank_id=0, post_roll_sec=0.5, max_frames=1000, max_tokens=1000),
         )
         buf = audio(5.0)
         spans = aligner.align_group(
@@ -980,9 +974,7 @@ class TestWav2Vec2PostRoll:
         """Post-roll so small as to yield an empty window raises."""
         aligner = make_wav2vec_aligner(
             logits_provider=make_logits_provider(np.zeros((1, 3), dtype=np.float32)),
-            config=Wav2Vec2Config(
-                blank_id=0, post_roll_sec=1e-9, max_frames=100, max_tokens=100
-            ),
+            config=Wav2Vec2Config(blank_id=0, post_roll_sec=1e-9, max_frames=100, max_tokens=100),
         )
         with pytest.raises((InvalidProviderOutputError, AlignmentError)):
             aligner.align_group(
@@ -1154,6 +1146,83 @@ class TestHybridPipeline:
         assert result.metadata["provider"] == "wav2vec2-ctc"
         aligner.close()
 
+    def test_canonical_reference_is_tokenized_per_physical_breath(self):
+        class _CanonicalTokenizerProvider:
+            def __call__(self, samples, sample_rate):
+                return _aligned_logits(32, 0, [1])
+
+            def encode_text(self, text):
+                assert "".join(text.split())
+                return [1], ["canonical-token"]
+
+        seg = QuranRecitationSegmenter(
+            backend_factory=lambda: lambda a: [(0.0, 0.5)],
+        )
+        forced = Wav2Vec2ForcedAligner(
+            logits_provider=_CanonicalTokenizerProvider(),
+            config=Wav2Vec2Config(blank_id=0, max_frames=1000, max_tokens=1000),
+        )
+        pipeline = HybridQuranAligner(
+            segmenter=seg,
+            forced_aligner=forced,
+            canonical_reference_provider=CanonicalQuranReferenceProvider(),
+        )
+        result = pipeline.align(audio(2.0), references=[CanonicalReferenceRequest(1, 1, 1, "hafs")])
+        assert len(result.spans) == 1
+        assert result.spans[0].token == "canonical-token"
+        assert result.metadata["canonical_reference_groups"] == 1
+        reference = result.metadata["canonical_references"][0]
+        assert reference["riwaya"] == "hafs"
+        assert reference["parts"][0]["surah_id"] == 1
+        assert len(reference["source_file_sha256"]) == 64
+        pipeline.close()
+
+    def test_canonical_stage_order_is_zipformer_then_tokenizer_then_ctc(self):
+        stages = []
+
+        class _TrackingTokenizerProvider:
+            def encode_text(self, text):
+                stages.append("tokenizer")
+                return [1], ["q"]
+
+            def __call__(self, samples, sample_rate):
+                stages.append("ctc")
+                return _aligned_logits(32, 0, [1])
+
+        segmenter = QuranRecitationSegmenter(
+            backend_factory=lambda: _TrackingBackend(stages, "segmentation"),
+        )
+        reference_aligner = ZipformerNeuralAligner(
+            make_evidence(), backend_factory=lambda: _TrackingRef(stages)
+        )
+        forced = Wav2Vec2ForcedAligner(
+            logits_provider=_TrackingTokenizerProvider(),
+            config=Wav2Vec2Config(blank_id=0, max_frames=1000, max_tokens=1000),
+        )
+        pipeline = HybridQuranAligner(
+            segmenter=segmenter,
+            reference_aligner=reference_aligner,
+            forced_aligner=forced,
+            canonical_reference_provider=CanonicalQuranReferenceProvider(),
+        )
+        pipeline.align(
+            audio(2.0),
+            references=[
+                CanonicalReferenceRequest(1, 1, 1, "hafs"),
+                CanonicalReferenceRequest(1, 2, 2, "hafs"),
+            ],
+        )
+        assert stages == [
+            "segmentation",
+            "reference",
+            "tokenizer",
+            "ctc",
+            "reference",
+            "tokenizer",
+            "ctc",
+        ]
+        pipeline.close()
+
     def test_exact_stage_ordering(self):
         """Pipeline must run: segmentation → reference evidence → CTC → validation."""
         stages = []
@@ -1166,9 +1235,7 @@ class TestHybridPipeline:
             backend_factory=lambda: _TrackingRef(stages),
         )
         fa = Wav2Vec2ForcedAligner(
-            logits_provider=_TrackingLogits(
-                stages, _aligned_logits(32, 0, [1, 2, 3, 4])
-            ),
+            logits_provider=_TrackingLogits(stages, _aligned_logits(32, 0, [1, 2, 3, 4])),
             config=Wav2Vec2Config(blank_id=0, max_frames=1000, max_tokens=1000),
         )
         pipeline = HybridQuranAligner(
@@ -1197,9 +1264,7 @@ class TestHybridPipeline:
         targets = [([index + 1], [f"t{index}"]) for index in range(4)]
         result = aligner.align(buf, targets)
         assert len(result.breath_groups) == 4
-        assert {span.token for span in result.spans} <= {
-            f"t{index}" for index in range(4)
-        }
+        assert {span.token for span in result.spans} <= {f"t{index}" for index in range(4)}
         with pytest.raises(InvalidProviderOutputError, match="one reference target"):
             aligner.align(buf, targets[:3])
         aligner.close()
@@ -1210,9 +1275,7 @@ class TestHybridPipeline:
         aligner = HybridQuranAligner(
             segmenter=seg,
             forced_aligner=Wav2Vec2ForcedAligner(
-                logits_provider=make_logits_provider(
-                    np.zeros((5, 3), dtype=np.float32)
-                ),
+                logits_provider=make_logits_provider(np.zeros((5, 3), dtype=np.float32)),
             ),
         )
         with pytest.raises((NoBreathGroupsError, SegmenterError)):
@@ -1224,9 +1287,7 @@ class TestHybridPipeline:
         aligner = HybridQuranAligner(
             segmenter=seg,
             forced_aligner=Wav2Vec2ForcedAligner(
-                logits_provider=make_logits_provider(
-                    np.zeros((5, 3), dtype=np.float32)
-                ),
+                logits_provider=make_logits_provider(np.zeros((5, 3), dtype=np.float32)),
             ),
         )
         with pytest.raises(NoBreathGroupsError, match="no speech groups"):
@@ -1292,22 +1353,20 @@ class TestHybridPipeline:
         aligner = self._make_aligner(
             reference_aligner=ZipformerNeuralAligner(
                 make_evidence(),
-                backend_factory=lambda: _FakeZipformerBackend(
-                    [PhonemeEmission(17, 2, 4, 0.9)]
-                ),
+                backend_factory=lambda: _FakeZipformerBackend([PhonemeEmission(17, 2, 4, 0.9)]),
             ),
         )
         buf = audio(2.0)
         result = aligner.align(buf, [([1, 2], ["a", "b"]), ([3, 4], ["c", "d"])])
         assert result.metadata["reference_groups"] == 2
+        assert result.metadata["zipformer_role"] == "unaligned_phoneme_emissions"
+        assert result.metadata["zipformer_reference_alignment_completed"] is False
         assert (
-            result.metadata["zipformer_role"] == "canonical_phoneme_reference_evidence"
+            result.metadata["zipformer_reference_alignment_status"]
+            == "blocked_missing_gated_phoneme_map"
         )
         assert result.metadata["zipformer_evidence_fused_into_final_spans"] is False
-        assert (
-            result.metadata["zipformer_and_wav2vec2_vocabularies_are_independent"]
-            is True
-        )
+        assert result.metadata["zipformer_and_wav2vec2_vocabularies_are_independent"] is True
         assert result.metadata["zipformer_reference_evidence"][0]["emissions"][0] == {
             "token_id": 17,
             "start_frame": 2,
@@ -1427,9 +1486,7 @@ class TestImportIsolation:
         import munajjam  # noqa: F401
 
         for mod in HEAVY_MODULES:
-            assert mod not in sys.modules, (
-                f"heavy module {mod} loaded on top-level import"
-            )
+            assert mod not in sys.modules, f"heavy module {mod} loaded on top-level import"
 
     def test_hybrid_aligner_import_clean(self):
         import munajjam.hybrid_aligner  # noqa: F401
@@ -1457,9 +1514,7 @@ class TestImportIsolation:
         )
         env = {
             **os.environ,
-            "PYTHONPATH": os.path.join(
-                os.path.dirname(__file__), "..", "..", "munajjam"
-            ),
+            "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "..", "munajjam"),
         }
         result = subprocess.run(
             [sys.executable, "-c", script],
@@ -1492,12 +1547,7 @@ class TestSecurity:
     def test_no_hardcoded_secrets(self):
         import pathlib
 
-        pkg_dir = (
-            pathlib.Path(__file__).parents[3]
-            / "munajjam"
-            / "munajjam"
-            / "hybrid_aligner"
-        )
+        pkg_dir = pathlib.Path(__file__).parents[3] / "munajjam" / "munajjam" / "hybrid_aligner"
         secret_patterns = ["api_key", "apikey", "password", "token", "secret"]
         for f in pkg_dir.glob("**/*.py"):
             content = f.read_text()

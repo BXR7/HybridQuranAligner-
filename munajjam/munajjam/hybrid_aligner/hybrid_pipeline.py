@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from munajjam.exceptions import InvalidProviderOutputError, ModelUnavailableError
 from munajjam.hybrid_aligner.model_manager import ModelManager, ModelSpec
 from munajjam.hybrid_aligner.neural_aligner import ZipformerEvidence, ZipformerNeuralAligner
 from munajjam.hybrid_aligner.recitation_segmenter import (
-    EnergyBreathSegmenter,
     QuranRecitationSegmenter,
+    TransformersRecitationSegmenterBackend,
+)
+from munajjam.hybrid_aligner.reference import (
+    CanonicalQuranReferenceProvider,
+    CanonicalReference,
+    CanonicalReferenceRequest,
 )
 from munajjam.hybrid_aligner.types import AlignmentSpan, AudioBuffer, HybridAlignmentResult
 from munajjam.hybrid_aligner.wav2vec2_aligner import (
@@ -29,8 +37,28 @@ from munajjam.hybrid_aligner.zipformer_backend import (
 )
 
 
+def _load_production_audio(audio: Any, sample_rate: int) -> AudioBuffer:
+    """Load paths or wrap samples without forcing model imports at construction."""
+    if isinstance(audio, AudioBuffer):
+        return audio
+    if isinstance(audio, (str, Path)):
+        return load_audio_file(audio, sample_rate)
+    try:
+        samples = np.asarray(audio, dtype=np.float32)
+    except Exception as exc:
+        raise InvalidProviderOutputError(
+            "audio must be a path, AudioBuffer, or mono samples"
+        ) from exc
+    return AudioBuffer(samples=samples, sample_rate=sample_rate)
+
+
 class HybridQuranAligner:
-    """Explicit, opt-in pipeline; existing Munajjam strategies remain unchanged."""
+    """Explicit, opt-in pipeline; existing Munajjam strategies remain unchanged.
+
+    ``references`` assigns an explicit canonical verse range to each detected
+    physical breath group. The aligner never infers verse numbers from duration,
+    and production construction rejects legacy caller-supplied token pairs.
+    """
 
     def __init__(
         self,
@@ -38,10 +66,14 @@ class HybridQuranAligner:
         segmenter: QuranRecitationSegmenter | None = None,
         reference_aligner: ZipformerNeuralAligner | None = None,
         forced_aligner: Wav2Vec2ForcedAligner | None = None,
+        canonical_reference_provider: CanonicalQuranReferenceProvider | None = None,
+        require_canonical_references: bool = False,
     ) -> None:
         self.segmenter = segmenter or QuranRecitationSegmenter()
         self.reference_aligner = reference_aligner
         self.forced_aligner = forced_aligner or Wav2Vec2ForcedAligner()
+        self.canonical_reference_provider = canonical_reference_provider
+        self.require_canonical_references = require_canonical_references
 
     @classmethod
     def from_pretrained(
@@ -53,33 +85,30 @@ class HybridQuranAligner:
         device: str | None = None,
         allow_download: bool = True,
     ) -> HybridQuranAligner:
-        """Construct only a fully specified real runtime; never install mocks.
+        """Construct a production pipeline with pinned, lazy model factories.
 
-        An explicit backend factory remains available for deterministic tests,
-        but normal production construction instantiates ``ZipformerOnnxBackend``
-        from the verified local artifact directory.
+        The method itself performs no downloads and imports no heavyweight ML
+        runtime. Zipformer weights, the segmenter model, and the Wav2Vec2 model
+        are loaded on the first inference that needs each component.
         """
         manager = ModelManager(cache_dir)
-        zip_dir = manager.resolve(
-            ModelSpec(
-                repository=ZIPFORMER_REPOSITORY,
-                revision=ZIPFORMER_REVISION,
-                files=(
-                    "config.json",
-                    "tokens.txt",
-                    "phoneme_units.json",
-                    "ordered_quran_phonemes.json",
-                    "quran_text2phoneme.json",
-                    "packing_front.json",
-                    "packing_back.json",
-                    "decode_with_confidence.py",
-                    "export_quran_streaming_onnx.py",
-                    "quran_per_eval.py",
-                    ZIPFORMER_MODEL,
-                ),
-                hashes={"tokens.txt": ZIPFORMER_TOKEN_SHA256},
+        zipformer_spec = ModelSpec(
+            repository=ZIPFORMER_REPOSITORY,
+            revision=ZIPFORMER_REVISION,
+            files=(
+                "config.json",
+                "tokens.txt",
+                "phoneme_units.json",
+                "ordered_quran_phonemes.json",
+                "quran_text2phoneme.json",
+                "packing_front.json",
+                "packing_back.json",
+                "decode_with_confidence.py",
+                "export_quran_streaming_onnx.py",
+                "quran_per_eval.py",
+                ZIPFORMER_MODEL,
             ),
-            allow_download=allow_download,
+            hashes={"tokens.txt": ZIPFORMER_TOKEN_SHA256},
         )
         evidence = zipformer_evidence or ZipformerEvidence(
             repository=ZIPFORMER_REPOSITORY,
@@ -95,41 +124,109 @@ class HybridQuranAligner:
             raise ModelUnavailableError(
                 "Zipformer evidence does not match the pinned production artifact"
             )
-        backend_factory = zipformer_backend_factory or (lambda: ZipformerOnnxBackend(zip_dir))
+
+        def make_zipformer_backend() -> Any:
+            if zipformer_backend_factory is not None:
+                return zipformer_backend_factory()
+            zip_dir = manager.resolve(zipformer_spec, allow_download=allow_download)
+            return ZipformerOnnxBackend(zip_dir)
+
         segmenter = QuranRecitationSegmenter(
-            loader=lambda audio, rate: load_audio_file(audio, rate),
-            backend_factory=lambda: EnergyBreathSegmenter(),
+            loader=_load_production_audio,
+            backend_factory=lambda: TransformersRecitationSegmenterBackend(
+                device=device, cache_dir=cache_dir
+            ),
         )
-        reference = ZipformerNeuralAligner(
-            evidence,
-            backend_factory=backend_factory,
+        reference = ZipformerNeuralAligner(evidence, backend_factory=make_zipformer_backend)
+        forced = Wav2Vec2ForcedAligner(
+            logits_provider_factory=lambda: TransformersWav2Vec2LogitsProvider(
+                device=device, cache_dir=cache_dir
+            )
         )
-        provider = TransformersWav2Vec2LogitsProvider(device=device, cache_dir=cache_dir)
-        forced = Wav2Vec2ForcedAligner(logits_provider=provider)
-        return cls(segmenter=segmenter, reference_aligner=reference, forced_aligner=forced)
+        return cls(
+            segmenter=segmenter,
+            reference_aligner=reference,
+            forced_aligner=forced,
+            canonical_reference_provider=CanonicalQuranReferenceProvider(),
+            require_canonical_references=True,
+        )
+
+    @staticmethod
+    def _reference_metadata(reference: CanonicalReference) -> dict[str, Any]:
+        return {
+            "riwaya": reference.riwaya,
+            "parts": [
+                {
+                    "kind": part.kind,
+                    "surah_id": part.surah_id,
+                    "ayah_number": part.ayah_number,
+                    "source": part.source,
+                    "source_sha256": part.source_sha256,
+                }
+                for part in reference.parts
+            ],
+            "source_file": reference.source_file,
+            "source_file_sha256": reference.source_file_sha256,
+            "text_sha256": reference.text_sha256,
+        }
 
     def align(
-        self, audio: Any, targets: Sequence[tuple[Sequence[int], Sequence[str]]]
+        self,
+        audio: Any,
+        targets: Sequence[tuple[Sequence[int], Sequence[str]]] | None = None,
+        *,
+        references: Sequence[CanonicalReferenceRequest] | None = None,
     ) -> HybridAlignmentResult:
+        if (targets is None) == (references is None):
+            raise InvalidProviderOutputError(
+                "provide exactly one of canonical references or legacy token targets"
+            )
+        if self.require_canonical_references and references is None:
+            raise InvalidProviderOutputError(
+                "production alignment requires canonical verse references, not caller token IDs"
+            )
+        if references is not None and self.canonical_reference_provider is None:
+            raise ModelUnavailableError("no canonical Quran reference provider is configured")
+
         buffer = (
             audio
             if isinstance(audio, AudioBuffer)
             else self.segmenter._loader(audio, self.segmenter.config.sample_rate)
         )
         groups = self.segmenter.segment(buffer)
-        if len(targets) != len(groups):
-            raise InvalidProviderOutputError("one reference target is required per breath group")
+        selected_references: list[CanonicalReference] | None = None
+        legacy_targets: list[tuple[Sequence[int], Sequence[str]]] | None = None
+        if references is not None:
+            if len(references) != len(groups):
+                raise InvalidProviderOutputError(
+                    "one canonical verse reference is required per breath group"
+                )
+            assert self.canonical_reference_provider is not None
+            selected_references = [
+                self.canonical_reference_provider.get_reference(request) for request in references
+            ]
+        else:
+            assert targets is not None
+            if len(targets) != len(groups):
+                raise InvalidProviderOutputError(
+                    "one reference target is required per breath group"
+                )
+            legacy_targets = list(targets)
+
         spans: list[AlignmentSpan] = []
         reference_evidence: list[dict[str, Any]] = []
-        for index, (group, target) in enumerate(zip(groups, targets, strict=True)):
-            token_ids, token_texts = target
+        for index, group in enumerate(groups):
+            canonical = selected_references[index] if selected_references is not None else None
             if self.reference_aligner is not None:
                 emissions = self.reference_aligner.align(buffer, group)
                 reference_evidence.append(
                     {
                         "group_index": index,
-                        "role": "reference_phoneme_evidence_not_fused",
+                        "role": "unaligned_phoneme_emissions",
                         "frame_duration_sec": ZIPFORMER_FRAME_DURATION_SEC,
+                        "canonical_reference": (
+                            self._reference_metadata(canonical) if canonical is not None else None
+                        ),
                         "emissions": [
                             {
                                 "token_id": item.token_id,
@@ -141,28 +238,54 @@ class HybridQuranAligner:
                         ],
                     }
                 )
+            if canonical is not None:
+                token_ids, token_texts = self.forced_aligner.encode_text(canonical.text)
+            else:
+                assert legacy_targets is not None
+                token_ids, token_texts = legacy_targets[index]
             next_start = groups[index + 1].start if index + 1 < len(groups) else None
             spans.extend(
                 self.forced_aligner.align_group(
                     buffer, group, token_ids, token_texts, next_group_start=next_start
                 )
             )
+
+        warnings: list[str] = []
+        if self.reference_aligner is not None:
+            warnings.append(
+                "Zipformer emissions are not aligned to canonical text: the pinned, gated "
+                "artifact's quran_text2phoneme.json/ordered_quran_phonemes.json schema is "
+                "not available in this environment. No cross-vocabulary token mapping is inferred."
+            )
         result = HybridAlignmentResult(
             groups,
             tuple(spans),
             metadata={
                 "provider": "wav2vec2-ctc",
+                "reference_groups": len(reference_evidence),
+                "canonical_reference_groups": len(selected_references or ()),
+                "canonical_references": (
+                    [self._reference_metadata(item) for item in selected_references]
+                    if selected_references is not None
+                    else []
+                ),
                 "zipformer_role": (
-                    "canonical_phoneme_reference_evidence"
+                    "unaligned_phoneme_emissions"
+                    if self.reference_aligner is not None
+                    else "not_configured"
+                ),
+                "zipformer_reference_alignment_completed": False,
+                "zipformer_reference_alignment_status": (
+                    "blocked_missing_gated_phoneme_map"
                     if self.reference_aligner is not None
                     else "not_configured"
                 ),
                 "zipformer_evidence_fused_into_final_spans": (
                     False if self.reference_aligner is not None else None
                 ),
-                "reference_groups": len(reference_evidence),
                 "zipformer_reference_evidence": reference_evidence,
                 "zipformer_and_wav2vec2_vocabularies_are_independent": True,
+                "warnings": warnings,
             },
         )
         result.validate(buffer.duration)
