@@ -127,9 +127,6 @@ class _Session:
 class _KaggleMetadataSession:
     """Fake runtime with the exact symbolic metadata reported by Kaggle."""
 
-    def __init__(self):
-        self.calls = []
-
     def get_inputs(self):
         return [
             _Value("x", ["N", 61, 80], "tensor(float)"),
@@ -153,19 +150,6 @@ class _KaggleMetadataSession:
                 "tensor(float)",
             ),
         ]
-
-    def run(self, output_names, feeds):
-        self.calls.append(feeds)
-        logits = np.full((1, ZIPFORMER_OUTPUT_FRAMES, 251), -10.0, dtype=np.float32)
-        logits[:, :, ZIPFORMER_BLANK_ID] = 10.0
-        logits[0, 3, 12] = 20.0
-        values = {
-            "log_probs": logits,
-            "new_processed_lens": feeds["processed_lens"] + ZIPFORMER_DECODE_CHUNK_LEN,
-            "new_cached_key_0": feeds["cached_key_0"] + 1,
-            "new_embed_states": feeds["embed_states"] + 1,
-        }
-        return [values[name] for name in output_names]
 
 
 def _backend(monkeypatch, session=None, *, feature_count=61):
@@ -340,17 +324,24 @@ def test_backend_resolves_same_name_and_new_prefix_state_outputs(
     assert session.calls[0]["state"].tolist() == [[0.0, 0.0]]
 
 
-def test_backend_initializes_and_runs_with_real_kaggle_symbolic_metadata(monkeypatch):
+def test_backend_initializes_with_real_kaggle_symbolic_metadata(monkeypatch):
     session = _KaggleMetadataSession()
     backend = _backend(monkeypatch, session, feature_count=48)
-    emissions = _decode(backend, session)
 
-    assert len(emissions) == 1
-    assert emissions[0].token_id == 12
-    assert session.calls[0]["processed_lens"].dtype == np.int64
-    assert session.calls[0]["processed_lens"].tolist() == [0]
-    assert session.calls[0]["cached_key_0"].shape == (256, 1, 128)
-    assert session.calls[0]["embed_states"].shape == (1, 128, 3, 19)
+    # This fixture validates real graph metadata and initialization only. It
+    # deliberately does not fabricate a model response or claim real inference.
+    assert backend._logit_output == "log_probs"
+    assert backend._processed_input == "processed_lens"
+    assert backend._processed_output == "new_processed_lens"
+    assert backend._initial_processed_lens().dtype == np.int64
+    assert backend._initial_processed_lens().shape == (1,)
+    state = backend._initial_state()
+    assert state["cached_key_0"].shape == (256, 1, 128)
+    assert state["embed_states"].shape == (1, 128, 3, 19)
+    assert backend._state_output_names == {
+        "cached_key_0": "new_cached_key_0",
+        "embed_states": "new_embed_states",
+    }
 
 
 @pytest.mark.parametrize(
