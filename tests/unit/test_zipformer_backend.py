@@ -32,48 +32,75 @@ class _Session:
         state_output="state",
         processed_output="processed_lens",
         output_shape=(1, ZIPFORMER_OUTPUT_FRAMES, 251),
+        runtime_output_frames=ZIPFORMER_OUTPUT_FRAMES,
+        runtime_batch=1,
+        runtime_vocabulary_size=251,
         token_frames=None,
         nonfinite_logits=False,
         nonfinite_state=False,
         nonfinite_processed=False,
+        processed_input_type="tensor(int32)",
+        processed_input_shape=(1,),
         processed_output_type="tensor(int32)",
+        processed_output_shape=(1,),
         acoustic_shape=(1, ZIPFORMER_INPUT_FRAMES, 80),
     ):
         self.state_type = state_type
         self.state_output = state_output
         self.processed_output = processed_output
         self.output_shape = list(output_shape)
+        self.runtime_output_frames = runtime_output_frames
+        self.runtime_batch = runtime_batch
+        self.runtime_vocabulary_size = runtime_vocabulary_size
         self.token_frames = token_frames or []
         self.nonfinite_logits = nonfinite_logits
         self.nonfinite_state = nonfinite_state
         self.nonfinite_processed = nonfinite_processed
+        self.processed_input_type = processed_input_type
+        self.processed_input_shape = list(processed_input_shape)
         self.processed_output_type = processed_output_type
+        self.processed_output_shape = list(processed_output_shape)
         self.acoustic_shape = list(acoustic_shape)
         self.calls = []
 
     def get_inputs(self):
         return [
             _Value("x", self.acoustic_shape),
-            _Value("processed_lens", [1], "tensor(int32)"),
+            _Value(
+                "processed_lens", self.processed_input_shape, self.processed_input_type
+            ),
             _Value("state", [1, 2], self.state_type),
         ]
 
     def get_outputs(self):
         return [
             _Value("log_probs", self.output_shape),
-            _Value(self.processed_output, [1], self.processed_output_type),
+            _Value(
+                self.processed_output,
+                self.processed_output_shape,
+                self.processed_output_type,
+            ),
             _Value(self.state_output, [1, 2], self.state_type),
         ]
 
     def run(self, output_names, feeds):
         self.calls.append(feeds)
-        logits = np.full((1, ZIPFORMER_OUTPUT_FRAMES, 251), -10.0, dtype=np.float32)
-        logits[:, :, ZIPFORMER_BLANK_ID] = 10.0
+        logits = np.full(
+            (
+                self.runtime_batch,
+                self.runtime_output_frames,
+                self.runtime_vocabulary_size,
+            ),
+            -10.0,
+            dtype=np.float32,
+        )
+        if self.runtime_vocabulary_size > ZIPFORMER_BLANK_ID:
+            logits[:, :, ZIPFORMER_BLANK_ID] = 10.0
         call_index = len(self.calls) - 1
         if call_index < len(self.token_frames):
             for frame_index, token_id in enumerate(self.token_frames[call_index]):
                 logits[0, frame_index, token_id] = 20.0
-        elif ZIPFORMER_OUTPUT_FRAMES > 3:
+        elif self.runtime_output_frames > 3 and self.runtime_vocabulary_size > 12:
             logits[0, 3, 12] = 20.0
         if self.nonfinite_logits:
             logits[0, 0, 0] = np.nan
@@ -95,6 +122,50 @@ class _Session:
         else:
             processed = np.asarray(feeds["processed_lens"] + ZIPFORMER_DECODE_CHUNK_LEN)
         return [logits, processed, state]
+
+
+class _KaggleMetadataSession:
+    """Fake runtime with the exact symbolic metadata reported by Kaggle."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_inputs(self):
+        return [
+            _Value("x", ["N", 61, 80], "tensor(float)"),
+            _Value("processed_lens", ["N"], "tensor(int64)"),
+            _Value("cached_key_0", [256, "N", 128], "tensor(float)"),
+            _Value("embed_states", ["N", 128, 3, 19], "tensor(float)"),
+        ]
+
+    def get_outputs(self):
+        return [
+            _Value("log_probs", ["N", "LogSoftmaxlog_probs_dim_1", 251]),
+            _Value("new_processed_lens", ["N"], "tensor(int64)"),
+            _Value(
+                "new_cached_key_0",
+                ["Slicenew_cached_key_0_dim_0", "N", 128],
+                "tensor(float)",
+            ),
+            _Value(
+                "new_embed_states",
+                ["N", 128, "Slicenew_embed_states_dim_2", 19],
+                "tensor(float)",
+            ),
+        ]
+
+    def run(self, output_names, feeds):
+        self.calls.append(feeds)
+        logits = np.full((1, ZIPFORMER_OUTPUT_FRAMES, 251), -10.0, dtype=np.float32)
+        logits[:, :, ZIPFORMER_BLANK_ID] = 10.0
+        logits[0, 3, 12] = 20.0
+        values = {
+            "log_probs": logits,
+            "new_processed_lens": feeds["processed_lens"] + ZIPFORMER_DECODE_CHUNK_LEN,
+            "new_cached_key_0": feeds["cached_key_0"] + 1,
+            "new_embed_states": feeds["embed_states"] + 1,
+        }
+        return [values[name] for name in output_names]
 
 
 def _backend(monkeypatch, session=None, *, feature_count=61):
@@ -269,6 +340,19 @@ def test_backend_resolves_same_name_and_new_prefix_state_outputs(
     assert session.calls[0]["state"].tolist() == [[0.0, 0.0]]
 
 
+def test_backend_initializes_and_runs_with_real_kaggle_symbolic_metadata(monkeypatch):
+    session = _KaggleMetadataSession()
+    backend = _backend(monkeypatch, session, feature_count=48)
+    emissions = _decode(backend, session)
+
+    assert len(emissions) == 1
+    assert emissions[0].token_id == 12
+    assert session.calls[0]["processed_lens"].dtype == np.int64
+    assert session.calls[0]["processed_lens"].tolist() == [0]
+    assert session.calls[0]["cached_key_0"].shape == (256, 1, 128)
+    assert session.calls[0]["embed_states"].shape == (1, 128, 3, 19)
+
+
 @pytest.mark.parametrize(
     ("type_name", "dtype"),
     [
@@ -318,14 +402,82 @@ def test_backend_rejects_nonfinite_processed_lens(monkeypatch):
 
 
 def test_backend_rejects_wrong_ctc_frame_count(monkeypatch):
-    session = _Session(output_shape=(1, 61, 251))
-    with pytest.raises(ModelUnavailableError, match="12,251"):
-        _backend(monkeypatch, session)
+    session = _Session(
+        output_shape=["N", "dynamic_time", 251],
+        runtime_output_frames=61,
+    )
+    backend = _backend(monkeypatch, session, feature_count=48)
+    with pytest.raises(InvalidProviderOutputError, match="12 CTC frames"):
+        _decode(backend, session)
+
+
+@pytest.mark.parametrize(
+    ("runtime_batch", "runtime_vocabulary_size", "message"),
+    [
+        (2, 251, "runtime shape \\[1,T,251\\]"),
+        (1, 51, "unambiguous 251-token axis"),
+    ],
+)
+def test_backend_rejects_wrong_runtime_batch_or_vocabulary(
+    monkeypatch, runtime_batch, runtime_vocabulary_size, message
+):
+    session = _Session(
+        output_shape=["N", "dynamic_time", 251],
+        runtime_batch=runtime_batch,
+        runtime_vocabulary_size=runtime_vocabulary_size,
+    )
+    backend = _backend(monkeypatch, session, feature_count=48)
+    with pytest.raises(InvalidProviderOutputError, match=message):
+        _decode(backend, session)
 
 
 def test_backend_rejects_output_without_251_class_axis(monkeypatch):
     session = _Session(output_shape=(1, ZIPFORMER_OUTPUT_FRAMES, 51))
-    with pytest.raises(ModelUnavailableError, match="12,251"):
+    with pytest.raises(ModelUnavailableError, match="unique 251-token axis"):
+        _backend(monkeypatch, session)
+
+
+def test_backend_rejects_ambiguous_structural_ctc_outputs(monkeypatch):
+    session = _Session(output_shape=["N", "dynamic_time", 251])
+    original_get_outputs = session.get_outputs
+    session.get_outputs = lambda: [
+        *original_get_outputs(),
+        _Value("second_ctc_output", ["N", "another_time", 251]),
+    ]
+    with pytest.raises(ModelUnavailableError, match="second_ctc_output"):
+        _backend(monkeypatch, session)
+
+
+@pytest.mark.parametrize(
+    ("onnx_type", "expected_dtype"),
+    [("tensor(int32)", np.int32), ("tensor(int64)", np.int64)],
+)
+def test_processed_lens_dtype_is_derived_from_real_input_metadata(
+    monkeypatch, onnx_type, expected_dtype
+):
+    session = _Session(
+        processed_input_type=onnx_type,
+        processed_input_shape=["N"],
+        processed_output_type=onnx_type,
+        processed_output_shape=["N"],
+        processed_output="new_processed_lens",
+    )
+    backend = _backend(monkeypatch, session, feature_count=96)
+    _decode(backend, session)
+    assert [feed["processed_lens"].dtype for feed in session.calls] == [
+        np.dtype(expected_dtype),
+        np.dtype(expected_dtype),
+    ]
+
+
+def test_processed_lens_rejects_input_output_dtype_mismatch(monkeypatch):
+    session = _Session(
+        processed_input_type="tensor(int64)",
+        processed_input_shape=["N"],
+        processed_output_type="tensor(int32)",
+        processed_output_shape=["N"],
+    )
+    with pytest.raises(ModelUnavailableError, match="dtypes differ"):
         _backend(monkeypatch, session)
 
 

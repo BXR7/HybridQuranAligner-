@@ -153,14 +153,26 @@ class ZipformerOnnxBackend:
         return candidates[0]
 
     def _find_processed_lens(self) -> tuple[str, str]:
-        inputs = {item.name for item in self._session.get_inputs()}
-        outputs = {item.name for item in self._session.get_outputs()}
+        inputs = {item.name: item for item in self._session.get_inputs()}
+        outputs = {item.name: item for item in self._session.get_outputs()}
         if "processed_lens" not in inputs:
             raise ModelUnavailableError("Zipformer graph is missing processed_lens input")
-        output = "new_processed_lens" if "new_processed_lens" in outputs else "processed_lens"
-        if output not in outputs:
+        output_name = "new_processed_lens" if "new_processed_lens" in outputs else "processed_lens"
+        if output_name not in outputs:
             raise ModelUnavailableError("Zipformer graph is missing processed_lens output")
-        return "processed_lens", output
+        input_value = inputs["processed_lens"]
+        output_value = outputs[output_name]
+        input_shape = self._shape(input_value)
+        output_shape = self._shape(output_value)
+        if input_shape is None or output_shape != input_shape:
+            raise ModelUnavailableError("Zipformer processed_lens input/output shapes differ")
+        input_dtype = self._numpy_dtype(input_value)
+        output_dtype = self._numpy_dtype(output_value)
+        if input_dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+            raise ModelUnavailableError("Zipformer processed_lens must use int32 or int64")
+        if output_dtype != input_dtype:
+            raise ModelUnavailableError("Zipformer processed_lens input/output dtypes differ")
+        return "processed_lens", output_name
 
     def _find_state_inputs(self) -> dict[str, Any]:
         outputs = {item.name: item for item in self._session.get_outputs()}
@@ -178,22 +190,62 @@ class ZipformerOnnxBackend:
             output_name = name if name in outputs else f"new_{name}"
             if output_name not in outputs:
                 raise ModelUnavailableError(f"Zipformer state output is missing for {name}")
+            input_shape = self._shape(self._state_inputs[name])
+            output_shape = self._metadata_shape(outputs[output_name])
+            if input_shape is None or output_shape is None or len(output_shape) != len(input_shape):
+                raise ModelUnavailableError(
+                    f"Zipformer state output {output_name} has an incompatible rank"
+                )
+            if any(
+                isinstance(output_dim, int) and output_dim != input_dim
+                for input_dim, output_dim in zip(input_shape, output_shape, strict=True)
+            ):
+                raise ModelUnavailableError(
+                    f"Zipformer state output {output_name} contradicts its input shape"
+                )
             self._state_output_names[name] = output_name
             result[name] = outputs[output_name]
         return result
 
+    @staticmethod
+    def _metadata_shape(value: Any) -> tuple[int | str | None, ...] | None:
+        """Return ONNX shape metadata while preserving symbolic dimensions."""
+        shape = getattr(value, "shape", None)
+        if not isinstance(shape, (list, tuple)):
+            return None
+        result: list[int | str | None] = []
+        for dimension in shape:
+            if dimension is None:
+                result.append(None)
+            elif isinstance(dimension, str) and dimension:
+                result.append(dimension)
+            elif isinstance(dimension, int) and not isinstance(dimension, bool) and dimension > 0:
+                result.append(dimension)
+            else:
+                return None
+        return tuple(result)
+
     def _logit_candidate_name(self) -> str:
         candidates = []
         for item in self._session.get_outputs():
-            shape = self._shape(item)
-            if shape in (
-                (1, ZIPFORMER_OUTPUT_FRAMES, ZIPFORMER_VOCABULARY_SIZE),
-                (1, ZIPFORMER_VOCABULARY_SIZE, ZIPFORMER_OUTPUT_FRAMES),
-            ):
+            shape = self._metadata_shape(item)
+            if shape is None or len(shape) != 3:
+                continue
+            vocabulary_axes = [
+                axis
+                for axis, dimension in enumerate(shape)
+                if dimension == ZIPFORMER_VOCABULARY_SIZE
+            ]
+            batch_dimension = shape[0]
+            batch_is_one_or_dynamic = (
+                batch_dimension == 1 or batch_dimension is None or isinstance(batch_dimension, str)
+            )
+            if len(vocabulary_axes) == 1 and vocabulary_axes[0] != 0 and batch_is_one_or_dynamic:
                 candidates.append(item.name)
         if len(candidates) != 1:
             raise ModelUnavailableError(
-                f"expected one Zipformer [1,12,251] or [1,251,12] output: {candidates}"
+                "expected one rank-3 Zipformer output with a unique 251-token axis "
+                f"and batch-first shape, got {candidates}"
             )
         return candidates[0]
 
@@ -271,8 +323,8 @@ class ZipformerOnnxBackend:
         if shape is None:
             raise ModelUnavailableError("Zipformer processed_lens has a dynamic shape")
         dtype = self._numpy_dtype(item)
-        if dtype != np.dtype(np.int32):
-            raise ModelUnavailableError("Zipformer processed_lens must use int32")
+        if dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+            raise ModelUnavailableError("Zipformer processed_lens must use int32 or int64")
         return np.zeros(shape, dtype=dtype)
 
     @staticmethod
@@ -344,15 +396,17 @@ class ZipformerOnnxBackend:
             outputs = self._session.run(output_names, feeds)
             by_name = dict(zip(output_names, outputs, strict=True))
             logits = np.asarray(by_name[self._logit_output], dtype=np.float32)
-            if logits.ndim != 3 or ZIPFORMER_VOCABULARY_SIZE not in logits.shape:
-                raise InvalidProviderOutputError("Zipformer logits do not contain a 251-token axis")
             logits = self._normalize_logits(logits)
-            if not np.all(np.isfinite(logits)):
-                raise InvalidProviderOutputError("Zipformer logits contain non-finite values")
-            if logits.shape[0] != 1 or logits.shape[1] != ZIPFORMER_OUTPUT_FRAMES:
+            if logits.shape[0] != 1 or logits.shape[2] != ZIPFORMER_VOCABULARY_SIZE:
+                raise InvalidProviderOutputError(
+                    "Zipformer logits must have runtime shape [1,T,251]"
+                )
+            if logits.shape[1] != ZIPFORMER_OUTPUT_FRAMES:
                 raise InvalidProviderOutputError(
                     "Zipformer must return 12 CTC frames for each 48-frame call"
                 )
+            if not np.all(np.isfinite(logits)):
+                raise InvalidProviderOutputError("Zipformer logits contain non-finite values")
             real_advance = min(ZIPFORMER_DECODE_CHUNK_LEN, len(features) - chunk_start)
             valid_output_frames = self._valid_output_frames(real_advance)
             ids = np.argmax(logits, axis=-1)
@@ -396,7 +450,7 @@ class ZipformerOnnxBackend:
             processed_value = np.asarray(by_name[self._processed_output])
             if (
                 processed_value.shape != processed_lens.shape
-                or processed_value.dtype != np.dtype(np.int32)
+                or processed_value.dtype != processed_lens.dtype
                 or not np.all(np.isfinite(processed_value))
             ):
                 raise InvalidProviderOutputError("Zipformer processed_lens output is invalid")
@@ -406,11 +460,18 @@ class ZipformerOnnxBackend:
 
     @staticmethod
     def _normalize_logits(logits: np.ndarray) -> np.ndarray:
-        if logits.shape[-1] == ZIPFORMER_VOCABULARY_SIZE:
+        if logits.ndim != 3:
+            raise InvalidProviderOutputError("Zipformer CTC output must be a rank-3 tensor")
+        vocabulary_axes = [
+            axis for axis in (1, 2) if logits.shape[axis] == ZIPFORMER_VOCABULARY_SIZE
+        ]
+        if len(vocabulary_axes) != 1:
+            raise InvalidProviderOutputError(
+                "Zipformer runtime output must contain one unambiguous 251-token axis"
+            )
+        if vocabulary_axes[0] == 2:
             return logits
-        if logits.shape[1] == ZIPFORMER_VOCABULARY_SIZE:
-            return np.transpose(logits, (0, 2, 1))
-        raise InvalidProviderOutputError("Zipformer output layout is not [N,T,251] or [N,251,T]")
+        return np.transpose(logits, (0, 2, 1))
 
     @staticmethod
     def _softmax(logits: np.ndarray) -> np.ndarray:
