@@ -191,19 +191,43 @@ aligner = HybridQuranAligner(
 result = aligner.align(audio_buffer, targets)
 ```
 
+`targets` is caller-supplied and must contain exactly one `(token_ids, token_texts)` pair
+for each detected breath group. The pipeline fails closed on a count mismatch; it does not
+guess Quran phrase boundaries or automatically assign ayat to breaths.
+
 ### Architecture
 
 ```
 audio
   ↓
-breath segmentation  (lazy, injectable segmenter boundary)
+breath segmentation  (signal-processing segmenter; group count is not fixed)
   ↓
-reference evidence   (optional, ZipformerNeuralAligner — gated)
+Zipformer reference evidence (gated, per-breath)
   ↓
 per-breath CTC       (Wav2Vec2ForcedAligner — provider-injected)
   ↓
 validated final alignment
 ```
+
+The upstream [Issue #120 acceptance criteria](https://github.com/Itqan-community/Munajjam/issues/120)
+describe Zipformer as the **reference phoneme-alignment stage** (including canonical
+reference text and Isti'adhah/Basmalah identification), followed by Wav2Vec2 microscopic
+forced alignment. The issue does not prescribe an evidence-fusion algorithm or a mapping
+between the 251-symbol Zipformer vocabulary and Wav2Vec2's 51-symbol vocabulary. Therefore
+this implementation retains Zipformer's validated per-breath emissions as explicit
+reference-phoneme evidence in result metadata, but does not claim that those emissions
+are fused into final spans. The two token spaces are never mapped or interchanged. This
+preserves the supported stage boundary without inventing fusion semantics; canonical
+text matching and Isti'adhah/Basmalah identification remain unimplemented until their
+authoritative mapping/decision contract is available.
+
+For the pinned Zipformer model card at revision
+`506422c82a81c86e7ae74a5a2ab4641724bcd3b3`, the documented streaming grid is a 61-frame
+fbank input, a 48-frame (0.48 s) advance, and 12 CTC output frames per full advance. Thus
+reference emission frame `i` maps to `i * 0.04` seconds relative to its breath-group start.
+Final padded-window trimming and the complete per-setting fbank equivalence still require
+verification against the gated pinned evaluator/exporter sources before claiming artifact-
+level equivalence.
 
 ### Optional model dependencies
 
@@ -215,6 +239,7 @@ constructed:
 - **transformers** — optional, required only by Transformer-based CTC backends.
 - **whisperx** — optional, used by the legacy server transcription path.
 - **onnxruntime** — optional, for ONNX-based model backends.
+- **kaldi-native-fbank** — optional, for Zipformer feature extraction.
 - **sherpa-onnx** — optional, for sherpa-onnx CTC backends.
 - **faster-whisper** — optional, for faster-whisper transcription backends.
 
@@ -224,6 +249,7 @@ corresponding neural backend:
 ```bash
 pip install torch transformers  # for CTC providers
 pip install sherpa-onnx         # for sherpa-onnx backend
+cd munajjam && pip install '.[zipformer]'  # ONNX Runtime + Kaldi native fbank
 ```
 
 ### Model access requirements
@@ -234,21 +260,26 @@ time and fails **closed** when evidence is missing or invalid:
 - **Repository:** must be `Quran-Lab/zipformer_p-arabic-v3`.
 - **Revision:** must be an immutable 40-character git SHA.
 - **Approval:** must be explicitly set to `True`.
-- **`tokens.txt`:** must contain exactly `vocabulary_size` lines; line
-  `blank_id` (0-indexed) must be the blank token `<blk>`.
-- **Phoneme mapping:** when `phoneme_mapping_required=True`, a `phonemes.txt`
-  mapping file must accompany `tokens.txt`.
+- **`tokens.txt`:** the pinned file is parsed by its explicit `<piece> <id>`
+  entries, not by line position; it must define all 251 IDs and `<blank>` at ID 250.
+  The pinned vocabulary SHA-256 is
+  `252c10687e442aa9291973065fae19fa39bcd681c4f5612ec496a647e20b43a1`.
+- **Feature extractor:** uses 16 kHz mono audio and 80-bin Kaldi fbank features;
+  see the pinned model-card revision and the implementation notes above for the
+  currently explicit settings and outstanding reference-script parity check.
 - **License:** the Zipformer model is subject to its upstream license; verify
   compliance before use.
 
 ### Limitations
 
-- The Zipformer reference-aligner integration does **not** auto-download or auto-cache
-  model weights. An operator-supplied backend factory and validated evidence are
-  required.
+- `ZipformerNeuralAligner.from_pretrained()` loads the pinned model into the
+  Hugging Face cache; an explicit `backend_factory` can instead be injected for tests
+  or a separately managed artifact directory.
 - Real-model smoke tests are **opt-in** and require credentials for HuggingFace Hub
   access to `Quran-Lab/zipformer_p-arabic-v3`.
-- The Wav2Vec2 CTC path supports CPU-only execution; CUDA is never implicitly selected.
+- Wav2Vec2 defaults to CUDA when available and otherwise uses CPU; an explicit
+  device can be supplied. Zipformer's ONNX Runtime provider list prefers CUDA and
+  falls back to CPU.
 - Post-roll retention is bounded by the next breath group boundary and the audio end.
 - No timestamps are ever synthesized without validated acoustic evidence from the CTC
   trellis.
@@ -259,7 +290,11 @@ Set `HF_TOKEN` in your environment and run:
 
 ```bash
 export HF_TOKEN=your-huggingface-token
-pytest tests/integration/test_zipformer_smoke.py -m "real and not slow" --real-model
+RUN_REAL_MODEL=1 PYTHONPATH=./munajjam pytest -m real_model \
+  tests/integration/test_zipformer_real_model.py
 ```
 
-Without `HF_TOKEN` or `--real-model`, real-model tests are skipped.
+The integration test also requires a real audio file (`QURAN_AUDIO_PATH`) or
+`ZIPFORMER_ARTIFACT_DIR`. If those, model access credentials, or a usable audio
+fixture are unavailable, pytest reports a skip rather than treating the model check
+as passed.

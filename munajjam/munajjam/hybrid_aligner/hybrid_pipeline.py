@@ -20,6 +20,7 @@ from munajjam.hybrid_aligner.wav2vec2_aligner import (
 )
 from munajjam.hybrid_aligner.zipformer_backend import (
     ZIPFORMER_BLANK_ID,
+    ZIPFORMER_FRAME_DURATION_SEC,
     ZIPFORMER_MODEL,
     ZIPFORMER_REPOSITORY,
     ZIPFORMER_REVISION,
@@ -119,12 +120,27 @@ class HybridQuranAligner:
         if len(targets) != len(groups):
             raise InvalidProviderOutputError("one reference target is required per breath group")
         spans: list[AlignmentSpan] = []
-        reference_count = 0
+        reference_evidence: list[dict[str, Any]] = []
         for index, (group, target) in enumerate(zip(groups, targets, strict=True)):
             token_ids, token_texts = target
             if self.reference_aligner is not None:
-                self.reference_aligner.align(buffer, group)
-                reference_count += 1
+                emissions = self.reference_aligner.align(buffer, group)
+                reference_evidence.append(
+                    {
+                        "group_index": index,
+                        "role": "reference_phoneme_evidence_not_fused",
+                        "frame_duration_sec": ZIPFORMER_FRAME_DURATION_SEC,
+                        "emissions": [
+                            {
+                                "token_id": item.token_id,
+                                "start_frame": item.start_frame,
+                                "end_frame": item.end_frame,
+                                "score": item.score,
+                            }
+                            for item in emissions
+                        ],
+                    }
+                )
             next_start = groups[index + 1].start if index + 1 < len(groups) else None
             spans.extend(
                 self.forced_aligner.align_group(
@@ -134,7 +150,20 @@ class HybridQuranAligner:
         result = HybridAlignmentResult(
             groups,
             tuple(spans),
-            metadata={"reference_groups": reference_count, "provider": "wav2vec2-ctc"},
+            metadata={
+                "provider": "wav2vec2-ctc",
+                "zipformer_role": (
+                    "canonical_phoneme_reference_evidence"
+                    if self.reference_aligner is not None
+                    else "not_configured"
+                ),
+                "zipformer_evidence_fused_into_final_spans": (
+                    False if self.reference_aligner is not None else None
+                ),
+                "reference_groups": len(reference_evidence),
+                "zipformer_reference_evidence": reference_evidence,
+                "zipformer_and_wav2vec2_vocabularies_are_independent": True,
+            },
         )
         result.validate(buffer.duration)
         return result

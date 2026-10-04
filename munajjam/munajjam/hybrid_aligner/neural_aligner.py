@@ -39,7 +39,8 @@ class ZipformerEvidence:
         - When ``phoneme_mapping_required`` is ``True`, a ``phonemes.txt``
           mapping file must accompany ``tokens.txt`` and map each token to its
           IPA phoneme.  The mapping must not cross breath boundaries.
-        - The model runs on CPU; no CUDA dependency is required or selected.
+        - The evidence contract does not require a particular device. The pinned ONNX
+          backend requests CUDA then CPU through ONNX Runtime's provider fallback.
     """
 
     repository: str
