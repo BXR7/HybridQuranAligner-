@@ -62,8 +62,7 @@ api = [
     "python-multipart>=0.0.6",
 ]
 zipformer = [
-    "onnxruntime>=1.17.0",
-    "kaldi-native-fbank>=1.22.0",
+    "sherpa-onnx>=1.13.8",
 ]
 segmenter = [
     "recitations-segmenter==1.0.0",

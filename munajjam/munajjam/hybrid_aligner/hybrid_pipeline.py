@@ -27,13 +27,14 @@ from munajjam.hybrid_aligner.wav2vec2_aligner import (
     load_audio_file,
 )
 from munajjam.hybrid_aligner.zipformer_backend import (
+    PUBLIC_ZIPFORMER_MODEL,
+    PUBLIC_ZIPFORMER_REPOSITORY,
+    PUBLIC_ZIPFORMER_REVISION,
+    PUBLIC_ZIPFORMER_TOKENS,
     ZIPFORMER_BLANK_ID,
     ZIPFORMER_FRAME_DURATION_SEC,
-    ZIPFORMER_MODEL,
-    ZIPFORMER_REPOSITORY,
-    ZIPFORMER_REVISION,
     ZIPFORMER_TOKEN_SHA256,
-    ZipformerOnnxBackend,
+    SherpaZipformerBackend,
 )
 
 
@@ -93,26 +94,14 @@ class HybridQuranAligner:
         """
         manager = ModelManager(cache_dir)
         zipformer_spec = ModelSpec(
-            repository=ZIPFORMER_REPOSITORY,
-            revision=ZIPFORMER_REVISION,
-            files=(
-                "config.json",
-                "tokens.txt",
-                "phoneme_units.json",
-                "ordered_quran_phonemes.json",
-                "quran_text2phoneme.json",
-                "packing_front.json",
-                "packing_back.json",
-                "decode_with_confidence.py",
-                "export_quran_streaming_onnx.py",
-                "quran_per_eval.py",
-                ZIPFORMER_MODEL,
-            ),
-            hashes={"tokens.txt": ZIPFORMER_TOKEN_SHA256},
+            repository=PUBLIC_ZIPFORMER_REPOSITORY,
+            revision=PUBLIC_ZIPFORMER_REVISION,
+            files=(PUBLIC_ZIPFORMER_TOKENS, PUBLIC_ZIPFORMER_MODEL),
+            hashes={PUBLIC_ZIPFORMER_TOKENS: ZIPFORMER_TOKEN_SHA256},
         )
         evidence = zipformer_evidence or ZipformerEvidence(
-            repository=ZIPFORMER_REPOSITORY,
-            revision=ZIPFORMER_REVISION,
+            repository=PUBLIC_ZIPFORMER_REPOSITORY,
+            revision=PUBLIC_ZIPFORMER_REVISION,
             approved=True,
             vocabulary_size=251,
             blank_id=ZIPFORMER_BLANK_ID,
@@ -120,7 +109,10 @@ class HybridQuranAligner:
             feature_kind="kaldi-fbank",
             token_table_sha256=ZIPFORMER_TOKEN_SHA256,
         )
-        if evidence.repository != ZIPFORMER_REPOSITORY or evidence.revision != ZIPFORMER_REVISION:
+        if (
+            evidence.repository != PUBLIC_ZIPFORMER_REPOSITORY
+            or evidence.revision != PUBLIC_ZIPFORMER_REVISION
+        ):
             raise ModelUnavailableError(
                 "Zipformer evidence does not match the pinned production artifact"
             )
@@ -129,7 +121,7 @@ class HybridQuranAligner:
             if zipformer_backend_factory is not None:
                 return zipformer_backend_factory()
             zip_dir = manager.resolve(zipformer_spec, allow_download=allow_download)
-            return ZipformerOnnxBackend(zip_dir)
+            return SherpaZipformerBackend(zip_dir)
 
         segmenter = QuranRecitationSegmenter(
             loader=_load_production_audio,
@@ -253,10 +245,8 @@ class HybridQuranAligner:
         warnings: list[str] = []
         if self.reference_aligner is not None:
             warnings.append(
-                "Zipformer emissions are not aligned to canonical text: the pinned repository "
-                "contains quran_text2phoneme.json and ordered_quran_phonemes.json, but their "
-                "gated contents/schema are inaccessible in this environment. No cross-vocabulary "
-                "token mapping is inferred."
+                "Public Zipformer emissions are available, but canonical phoneme-target DP "
+                "fusion is not enabled until an authoritative token-target provider is supplied."
             )
         result = HybridAlignmentResult(
             groups,
@@ -277,7 +267,13 @@ class HybridQuranAligner:
                 ),
                 "zipformer_reference_alignment_completed": False,
                 "zipformer_reference_alignment_status": (
-                    "blocked_gated_artifact_access"
+                    (
+                        "public_model_alignment_pending"
+                        if self.reference_aligner.evidence is not None
+                        and self.reference_aligner.evidence.repository
+                        == "Alimalas/munajjam-onnx-models"
+                        else "blocked_gated_artifact_access"
+                    )
                     if self.reference_aligner is not None
                     else "not_configured"
                 ),

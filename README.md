@@ -217,41 +217,27 @@ breath segmentation  (pinned obadx/recitation-segmenter-v2 model; group count va
   ↓
 canonical Quran reference (explicit verse ranges, per-breath, provenance-bearing)
   ↓
-Zipformer phoneme emissions (pinned, gated artifact; currently not text-aligned)
+Zipformer phoneme emissions (public Alimalas ONNX artifact via sherpa-onnx)
   ↓
 per-breath CTC       (Wav2Vec2 tokenizer + constrained trellis)
   ↓
 validated final alignment
 ```
 
-The upstream [Issue #120 acceptance criteria](https://github.com/Itqan-community/Munajjam/issues/120)
-describe Zipformer as the **reference phoneme-alignment stage**, followed by Wav2Vec2
-microscopic forced alignment. The pinned revision's public repository tree confirms that
-`quran_text2phoneme.json`, `ordered_quran_phonemes.json`, `phoneme_units.json`, and
-`tokens.txt` exist. The model card describes the first as an evaluation text-to-phoneme
-lookup, the second as canonical phonemization for all 6,236 ayat, and the third as the
-phoneme-unit inventory. The card also states that `tokens.txt` is the CTC symbol table
-and its IDs are offset from raw `phoneme_units.json` IDs (Zipformer blank is 250).
-However, the repository is manually gated: direct retrieval of all four files and the
-upstream evaluation/export scripts returns HTTP 401 in this environment. Results therefore
-mark Zipformer emissions as **unaligned evidence** and metadata says
-`blocked_gated_artifact_access`; they do not claim canonical Zipformer alignment or
-evidence fusion until the exact gated schemas are inspected. No mapping between the
-251-symbol Zipformer and 51-symbol Wav2Vec2 vocabularies is inferred. The exact remaining
-access and verification evidence is recorded in
-[`docs/issue_120_external_sources.md`](docs/issue_120_external_sources.md).
-An independent artifact investigation reached the same conclusion: the payloads are
-present at the pinned revision, but content access and real inference are blocked by the
-manual gate. See [`ISSUE120_ARTIFACT_INVESTIGATION.md`](ISSUE120_ARTIFACT_INVESTIGATION.md)
-for exact questions, hashes, interface notes, and verification results.
+The production Zipformer route uses the public, immutable-revision Hugging Face repository
+[`Alimalas/munajjam-onnx-models`](https://huggingface.co/Alimalas/munajjam-onnx-models),
+specifically `model_zipformer/zipformer_p_arabic_v3.onnx` and `tokens.txt`, through
+`sherpa-onnx.OnlineRecognizer.from_zipformer2_ctc`. Its 251-token output is decoded in
+the Zipformer vocabulary and timestamped at the 40 ms emission grid. This is independent
+of the 51-token Wav2Vec2 vocabulary; no numeric vocabulary bridge is inferred. A genuine
+public-model smoke test has produced timestamped emissions on real Al-Fatiha audio.
+Canonical phoneme-target DP fusion remains an explicit follow-up seam: the current pipeline
+records public Zipformer evidence and performs Wav2Vec2 forced alignment, but does not claim
+that evidence has been fused into final spans until an authoritative target provider is
+configured.
 
-For the pinned Zipformer model card at revision
-`506422c82a81c86e7ae74a5a2ab4641724bcd3b3`, the documented streaming grid is a 61-frame
-fbank input, a 48-frame (0.48 s) advance, and 12 CTC output frames per full advance. Thus
-reference emission frame `i` maps to `i * 0.04` seconds relative to its breath-group start.
-Final padded-window trimming and the complete per-setting fbank equivalence still require
-verification against the gated pinned evaluator/exporter sources before claiming artifact-
-level equivalence.
+The public model is pinned to revision `5dbab4db48a88f5a2a76ead282b2bc3d4b958ee0` and uses
+sherpa-onnx's exporter-defined streaming state and feature pipeline.
 
 ### Optional model dependencies
 
@@ -262,8 +248,6 @@ constructed:
 - **torch** — optional, required only by neural model backends.
 - **transformers** — optional, required only by Transformer-based CTC backends.
 - **whisperx** — optional, used by the legacy server transcription path.
-- **onnxruntime** — optional, for ONNX-based model backends.
-- **kaldi-native-fbank** — optional, for Zipformer feature extraction.
 - **sherpa-onnx** — optional, for sherpa-onnx CTC backends.
 - **faster-whisper** — optional, for faster-whisper transcription backends.
 
@@ -273,8 +257,7 @@ segmenter/Wav2Vec2 dependencies and Zipformer runtime only when needed:
 
 ```bash
 pip install 'munajjam[segmenter,zipformer]'
-pip install sherpa-onnx         # for sherpa-onnx backend
-cd munajjam && pip install '.[zipformer]'  # ONNX Runtime + Kaldi native fbank
+cd munajjam && pip install '.[zipformer]'  # public Zipformer via sherpa-onnx
 ```
 
 ### Model access requirements
@@ -282,16 +265,14 @@ cd munajjam && pip install '.[zipformer]'  # ONNX Runtime + Kaldi native fbank
 The `ZipformerNeuralAligner` validates operator-supplied evidence at construction
 time and fails **closed** when evidence is missing or invalid:
 
-- **Repository:** must be `Quran-Lab/zipformer_p-arabic-v3`.
+- **Repository:** production defaults to `Alimalas/munajjam-onnx-models`.
 - **Revision:** must be an immutable 40-character git SHA.
 - **Approval:** must be explicitly set to `True`.
 - **`tokens.txt`:** the pinned file is parsed by its explicit `<piece> <id>`
   entries, not by line position; it must define all 251 IDs and `<blank>` at ID 250.
   The pinned vocabulary SHA-256 is
   `252c10687e442aa9291973065fae19fa39bcd681c4f5612ec496a647e20b43a1`.
-- **Feature extractor:** uses 16 kHz mono audio and 80-bin Kaldi fbank features;
-  see the pinned model-card revision and the implementation notes above for the
-  currently explicit settings and outstanding reference-script parity check.
+- **Feature extractor:** sherpa-onnx uses 16 kHz mono audio and 80-dimensional fbank features.
 - **License:** the Zipformer model is subject to its upstream license; verify
   compliance before use.
 
@@ -300,21 +281,18 @@ time and fails **closed** when evidence is missing or invalid:
 - `ZipformerNeuralAligner.from_pretrained()` loads the pinned model into the
   Hugging Face cache; an explicit `backend_factory` can instead be injected for tests
   or a separately managed artifact directory.
-- Real-model smoke tests are **opt-in** and require credentials for HuggingFace Hub
-  access to `Quran-Lab/zipformer_p-arabic-v3`.
-- Wav2Vec2 defaults to CUDA when available and otherwise uses CPU; an explicit
-  device can be supplied. Zipformer's ONNX Runtime provider list prefers CUDA and
-  falls back to CPU.
+- Real-model smoke tests are **opt-in** and use the public Hugging Face artifact without
+  credentials. The complete tripartite E2E additionally requires the segmenter, Wav2Vec2
+  runtime, and real audio.
+- Wav2Vec2 defaults to CUDA when available and otherwise uses CPU; an explicit device
+  can be supplied.
 - Post-roll retention is bounded by the next breath group boundary and the audio end.
 - No timestamps are ever synthesized without validated acoustic evidence from the CTC
   trellis.
 
 ### Real-model smoke test instructions
 
-Set `HF_TOKEN` in your environment and run:
-
 ```bash
-export HF_TOKEN=your-huggingface-token
 RUN_REAL_MODEL=1 PYTHONPATH=./munajjam pytest -m real_model \
   tests/integration/test_zipformer_real_model.py
 ```

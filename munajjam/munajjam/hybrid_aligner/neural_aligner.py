@@ -13,11 +13,12 @@ from munajjam.hybrid_aligner.types import AudioBuffer, BreathGroup, PhonemeEmiss
 
 @dataclass(frozen=True, slots=True)
 class ZipformerEvidence:
-    """Validated operator-supplied evidence for the gated Zipformer model.
+    """Validated operator-supplied evidence for a Zipformer CTC model.
 
     Fields:
         repository: HuggingFace/Git repository ID. Must be
-            ``Quran-Lab/zipformer_p-arabic-v3``.
+            ``Quran-Lab/zipformer_p-arabic-v3`` or the public
+            ``Alimalas/munajjam-onnx-models`` artifact.
         revision: Immutable git commit SHA (40 hex characters).
         approved: Operator attestation that the artifact is approved for use.
             Must be ``True``.
@@ -57,14 +58,17 @@ class ZipformerEvidence:
     phoneme_mapping_required: bool = False
 
     def __post_init__(self) -> None:
-        if self.repository != "Quran-Lab/zipformer_p-arabic-v3":
+        if self.repository not in {
+            "Quran-Lab/zipformer_p-arabic-v3",
+            "Alimalas/munajjam-onnx-models",
+        }:
             raise ValueError("unsupported Zipformer repository")
         if len(self.revision) != 40 or not all(
             c in "0123456789abcdef" for c in self.revision.lower()
         ):
             raise ValueError("revision must be an immutable git SHA")
         if not self.approved:
-            raise ValueError("gated Zipformer evidence is not approved")
+            raise ValueError("Zipformer evidence is not approved")
         for name, value in (
             ("vocabulary_size", self.vocabulary_size),
             ("blank_id", self.blank_id),
@@ -104,7 +108,9 @@ class ZipformerNeuralAligner:
 
     def _get_backend(self) -> ZipformerBackend:
         if self.evidence is None or self._backend_factory is None:
-            raise ModelUnavailableError("Zipformer is gated or has no verified runtime evidence")
+            raise ModelUnavailableError(
+                "Zipformer has no verified runtime evidence (gated or unavailable)"
+            )
         if self._backend is None:
             with self._lock:
                 if self._backend is None:

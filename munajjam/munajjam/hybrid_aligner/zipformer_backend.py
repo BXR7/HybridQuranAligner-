@@ -24,6 +24,10 @@ ZIPFORMER_MODEL = "zipformer_p_arabic_v3.1.onnx"
 ZIPFORMER_VOCABULARY_SIZE = 251
 ZIPFORMER_BLANK_ID = 250
 ZIPFORMER_TOKEN_SHA256 = "252c10687e442aa9291973065fae19fa39bcd681c4f5612ec496a647e20b43a1"
+PUBLIC_ZIPFORMER_REPOSITORY = "Alimalas/munajjam-onnx-models"
+PUBLIC_ZIPFORMER_REVISION = "5dbab4db48a88f5a2a76ead282b2bc3d4b958ee0"
+PUBLIC_ZIPFORMER_MODEL = "model_zipformer/zipformer_p_arabic_v3.onnx"
+PUBLIC_ZIPFORMER_TOKENS = "model_zipformer/tokens.txt"
 # Pinned model-card contract at ZIPFORMER_REVISION: 61 input fbank frames,
 # 48-frame (0.48 s) decode advance, and 12 CTC outputs per full advance.
 ZIPFORMER_INPUT_FRAMES = 61
@@ -481,3 +485,112 @@ class ZipformerOnnxBackend:
 
     def close(self) -> None:
         self._session = None
+
+
+class SherpaZipformerBackend:
+    """Run the public Zipformer CTC artifact through sherpa-onnx."""
+
+    def __init__(
+        self,
+        artifact_dir: str | Path,
+        *,
+        model_name: str = PUBLIC_ZIPFORMER_MODEL,
+        tokens_name: str = PUBLIC_ZIPFORMER_TOKENS,
+        recognizer_factory: Callable[..., Any] | None = None,
+        num_threads: int = 4,
+    ) -> None:
+        self.artifact_dir = Path(artifact_dir)
+        self.model_path = self.artifact_dir / model_name
+        self.tokens_path = self.artifact_dir / tokens_name
+        if not self.model_path.is_file() or not self.tokens_path.is_file():
+            raise ModelUnavailableError("public Zipformer ONNX model or tokens.txt is missing")
+        try:
+            self._tokens = ZipformerOnnxBackend._parse_token_table(
+                self.tokens_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise ModelUnavailableError("unable to parse public Zipformer tokens.txt") from exc
+        if len(self._tokens) != ZIPFORMER_VOCABULARY_SIZE:
+            raise ModelUnavailableError("public Zipformer tokens.txt must contain 251 tokens")
+        if self._tokens[ZIPFORMER_BLANK_ID] != "<blank>":
+            raise ModelUnavailableError("public Zipformer blank token metadata is invalid")
+        self._token_ids = {token: index for index, token in enumerate(self._tokens)}
+        self._num_threads = num_threads
+        self._recognizer_factory = recognizer_factory or self._default_recognizer_factory
+        self._recognizer: Any | None = None
+
+    def _default_recognizer_factory(self, *, tokens: str, model: str) -> Any:
+        try:
+            import sherpa_onnx
+
+            return sherpa_onnx.OnlineRecognizer.from_zipformer2_ctc(
+                tokens=tokens,
+                model=model,
+                num_threads=self._num_threads,
+                sample_rate=16_000,
+                feature_dim=80,
+                enable_endpoint_detection=False,
+                decoding_method="greedy_search",
+            )
+        except Exception as exc:
+            raise ModelUnavailableError(
+                "sherpa-onnx is required for the public Zipformer backend"
+            ) from exc
+
+    def _get_recognizer(self) -> Any:
+        if self._recognizer is None:
+            self._recognizer = self._recognizer_factory(
+                tokens=str(self.tokens_path), model=str(self.model_path)
+            )
+        return self._recognizer
+
+    def __call__(self, audio: AudioBuffer, group: BreathGroup) -> list[PhonemeEmission]:
+        if audio.sample_rate != 16_000 or group.end > audio.duration:
+            raise InvalidProviderOutputError(
+                "public Zipformer requires 16 kHz audio inside the breath bounds"
+            )
+        start = round(group.start * audio.sample_rate)
+        end = round(group.end * audio.sample_rate)
+        recognizer = self._get_recognizer()
+        stream = recognizer.create_stream()
+        stream.accept_waveform(
+            audio.sample_rate, np.asarray(audio.samples[start:end], dtype=np.float32)
+        )
+        stream.input_finished()
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+        tokens = list(recognizer.tokens(stream))
+        timestamps = list(recognizer.timestamps(stream))
+        probabilities = list(recognizer.ys_probs(stream))
+        if len(tokens) != len(timestamps):
+            raise InvalidProviderOutputError(
+                "sherpa-onnx returned mismatched tokens and timestamps"
+            )
+        emissions: list[PhonemeEmission] = []
+        previous_end = 0
+        for index, (token, timestamp) in enumerate(zip(tokens, timestamps, strict=True)):
+            if token not in self._token_ids:
+                raise InvalidProviderOutputError(f"sherpa-onnx returned unknown token {token!r}")
+            if not np.isfinite(timestamp) or timestamp < 0:
+                raise InvalidProviderOutputError("sherpa-onnx returned invalid token timestamps")
+            start_frame = max(previous_end, round(float(timestamp) / ZIPFORMER_FRAME_DURATION_SEC))
+            next_timestamp = timestamps[index + 1] if index + 1 < len(timestamps) else None
+            end_frame = (
+                round(float(next_timestamp) / ZIPFORMER_FRAME_DURATION_SEC)
+                if next_timestamp is not None
+                else start_frame + 1
+            )
+            end_frame = max(start_frame + 1, end_frame)
+            score = float(probabilities[index]) if index < len(probabilities) else 1.0
+            if not np.isfinite(score):
+                raise InvalidProviderOutputError("sherpa-onnx returned an invalid token score")
+            emissions.append(
+                PhonemeEmission(
+                    self._token_ids[token], start_frame, end_frame, min(1.0, max(0.0, score))
+                )
+            )
+            previous_end = end_frame
+        return emissions
+
+    def close(self) -> None:
+        self._recognizer = None
