@@ -1,5 +1,10 @@
 """Opt-in hybrid alignment API with dependency-free imports."""
 
+from munajjam.hybrid_aligner.canonical_zipformer import (
+    ZipformerDPAlignment,
+    ZipformerDPCell,
+    align_zipformer_to_reference,
+)
 from munajjam.hybrid_aligner.hybrid_pipeline import HybridQuranAligner
 from munajjam.hybrid_aligner.model_manager import ModelManager, ModelSpec
 from munajjam.hybrid_aligner.neural_aligner import ZipformerEvidence, ZipformerNeuralAligner
@@ -45,6 +50,9 @@ from munajjam.hybrid_aligner.zipformer_backend import (
 
 __all__ = [
     "AlignmentSpan",
+    "ZipformerDPAlignment",
+    "ZipformerDPCell",
+    "align_zipformer_to_reference",
     "AudioBuffer",
     "BreathGroup",
     "CanonicalQuranReferenceProvider",

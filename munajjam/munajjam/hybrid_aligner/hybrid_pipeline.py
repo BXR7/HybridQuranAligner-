@@ -9,6 +9,10 @@ from typing import Any
 import numpy as np
 
 from munajjam.exceptions import InvalidProviderOutputError, ModelUnavailableError
+from munajjam.hybrid_aligner.canonical_zipformer import (
+    align_zipformer_to_reference,
+    alignment_evidence,
+)
 from munajjam.hybrid_aligner.model_manager import ModelManager, ModelSpec
 from munajjam.hybrid_aligner.neural_aligner import ZipformerEvidence, ZipformerNeuralAligner
 from munajjam.hybrid_aligner.recitation_segmenter import (
@@ -207,43 +211,76 @@ class HybridQuranAligner:
 
         spans: list[AlignmentSpan] = []
         reference_evidence: list[dict[str, Any]] = []
+        fused_groups = 0
         for index, group in enumerate(groups):
             canonical = selected_references[index] if selected_references is not None else None
+            group_alignment = None
             if self.reference_aligner is not None:
                 emissions = self.reference_aligner.align(buffer, group)
-                reference_evidence.append(
-                    {
-                        "group_index": index,
-                        "role": "unaligned_phoneme_emissions",
-                        "frame_duration_sec": ZIPFORMER_FRAME_DURATION_SEC,
-                        "canonical_reference": (
-                            self._reference_metadata(canonical) if canonical is not None else None
-                        ),
-                        "emissions": [
-                            {
-                                "token_id": item.token_id,
-                                "start_frame": item.start_frame,
-                                "end_frame": item.end_frame,
-                                "score": item.score,
-                            }
-                            for item in emissions
-                        ],
-                    }
+                evidence = {
+                    "group_index": index,
+                    "frame_duration_sec": ZIPFORMER_FRAME_DURATION_SEC,
+                    "canonical_reference": (
+                        self._reference_metadata(canonical) if canonical is not None else None
+                    ),
+                    "emissions": [
+                        {
+                            "token_id": item.token_id,
+                            "start_frame": item.start_frame,
+                            "end_frame": item.end_frame,
+                            "score": item.score,
+                        }
+                        for item in emissions
+                    ],
+                }
+                is_public = (
+                    canonical is not None
+                    and self.reference_aligner.evidence is not None
+                    and self.reference_aligner.evidence.repository == PUBLIC_ZIPFORMER_REPOSITORY
                 )
+                if is_public:
+                    group_alignment = align_zipformer_to_reference(
+                        emissions, self.reference_aligner.token_table(), canonical
+                    )
+                    evidence["role"] = "canonical_character_dp_fusion"
+                    evidence["alignment"] = alignment_evidence(
+                        group_alignment, group, frame_duration_sec=ZIPFORMER_FRAME_DURATION_SEC
+                    )
+                    fused_groups += 1
+                else:
+                    evidence["role"] = "unaligned_phoneme_emissions"
+                reference_evidence.append(evidence)
             if canonical is not None:
                 token_ids, token_texts = self.forced_aligner.encode_text(canonical.text)
             else:
                 assert legacy_targets is not None
                 token_ids, token_texts = legacy_targets[index]
             next_start = groups[index + 1].start if index + 1 < len(groups) else None
-            spans.extend(
+            group_spans = list(
                 self.forced_aligner.align_group(
                     buffer, group, token_ids, token_texts, next_group_start=next_start
                 )
             )
+            if group_alignment is not None:
+                group_spans = [
+                    AlignmentSpan(
+                        span.token,
+                        span.start,
+                        span.end,
+                        span.confidence,
+                        "wav2vec2-ctc+zipformer-character-dp",
+                    )
+                    for span in group_spans
+                ]
+            spans.extend(group_spans)
 
         warnings: list[str] = []
-        if self.reference_aligner is not None:
+        public_fusion_complete = (
+            self.reference_aligner is not None
+            and selected_references is not None
+            and fused_groups == len(groups)
+        )
+        if self.reference_aligner is not None and not public_fusion_complete:
             warnings.append(
                 "Public Zipformer emissions are available, but canonical phoneme-target DP "
                 "fusion is not enabled until an authoritative token-target provider is supplied."
@@ -265,20 +302,22 @@ class HybridQuranAligner:
                     if self.reference_aligner is not None
                     else "not_configured"
                 ),
-                "zipformer_reference_alignment_completed": False,
+                "zipformer_reference_alignment_completed": public_fusion_complete,
                 "zipformer_reference_alignment_status": (
                     (
-                        "public_model_alignment_pending"
+                        "canonical_character_dp_verified"
+                        if public_fusion_complete
+                        else "public_model_alignment_pending"
                         if self.reference_aligner.evidence is not None
                         and self.reference_aligner.evidence.repository
-                        == "Alimalas/munajjam-onnx-models"
+                        == PUBLIC_ZIPFORMER_REPOSITORY
                         else "blocked_gated_artifact_access"
                     )
                     if self.reference_aligner is not None
                     else "not_configured"
                 ),
                 "zipformer_evidence_fused_into_final_spans": (
-                    False if self.reference_aligner is not None else None
+                    public_fusion_complete if self.reference_aligner is not None else None
                 ),
                 "zipformer_reference_evidence": reference_evidence,
                 "zipformer_and_wav2vec2_vocabularies_are_independent": True,

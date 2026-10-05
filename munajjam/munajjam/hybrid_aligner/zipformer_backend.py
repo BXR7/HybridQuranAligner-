@@ -96,6 +96,11 @@ class ZipformerOnnxBackend:
             )
         return tokens
 
+    @property
+    def token_table(self) -> tuple[str, ...]:
+        """Return the verified token table used by the loaded artifact."""
+        return tuple(self._tokens)
+
     @staticmethod
     def _parse_token_table(text: str) -> list[str]:
         """Parse the artifact's ``piece id`` table, independent of line order."""
@@ -518,6 +523,11 @@ class SherpaZipformerBackend:
         self._num_threads = num_threads
         self._recognizer_factory = recognizer_factory or self._default_recognizer_factory
         self._recognizer: Any | None = None
+
+    @property
+    def token_table(self) -> tuple[str, ...]:
+        """Return the verified token table used by the public recognizer."""
+        return tuple(self._tokens)
 
     def _default_recognizer_factory(self, *, tokens: str, model: str) -> Any:
         try:

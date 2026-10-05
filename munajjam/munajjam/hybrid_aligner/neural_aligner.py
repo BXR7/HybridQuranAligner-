@@ -91,6 +91,9 @@ class ZipformerEvidence:
 class ZipformerBackend(Protocol):
     def __call__(self, audio: AudioBuffer, group: BreathGroup) -> list[PhonemeEmission]: ...
 
+    @property
+    def token_table(self) -> tuple[str, ...]: ...
+
 
 class ZipformerNeuralAligner:
     """Only exposes a provider after operator-supplied evidence is validated."""
@@ -143,6 +146,18 @@ class ZipformerNeuralAligner:
             result.append(emission)
             previous = emission.end_frame
         return tuple(result)
+
+    def token_table(self) -> tuple[str, ...]:
+        """Return the exact artifact token table from the initialized backend."""
+        backend = self._get_backend()
+        table = getattr(backend, "token_table", None)
+        if not isinstance(table, tuple) or not table:
+            raise ModelUnavailableError(
+                "Zipformer backend does not expose its verified token table"
+            )
+        if any(not isinstance(token, str) for token in table):
+            raise InvalidProviderOutputError("Zipformer token table contains a non-string token")
+        return table
 
     def close(self) -> None:
         backend, self._backend = self._backend, None
