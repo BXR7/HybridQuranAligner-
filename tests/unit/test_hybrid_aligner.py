@@ -1363,7 +1363,7 @@ class TestHybridPipeline:
         assert result.metadata["zipformer_reference_alignment_completed"] is False
         assert (
             result.metadata["zipformer_reference_alignment_status"]
-            == "blocked_missing_gated_phoneme_map"
+            == "blocked_gated_artifact_access"
         )
         assert result.metadata["zipformer_evidence_fused_into_final_spans"] is False
         assert result.metadata["zipformer_and_wav2vec2_vocabularies_are_independent"] is True

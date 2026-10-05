@@ -1,5 +1,12 @@
 # Issue #120 — Tripartite Neural Hybrid Quran Alignment: Full Audit Report
 
+> **2026-10-05 correction:** this historical audit's `phonemes.txt` requirement and
+> “contract-complete” wording are superseded. The exact pinned Hugging Face tree contains
+> `ordered_quran_phonemes.json`, `quran_text2phoneme.json`, `phoneme_units.json`, and
+> `tokens.txt`, but no separate `phonemes.txt`. The files and source scripts return HTTP 401
+> without authorized access, so their schemas and production reference adapter remain
+> unverified. See [`ISSUE120_ARTIFACT_INVESTIGATION.md`](ISSUE120_ARTIFACT_INVESTIGATION.md).
+
 ## Executive Summary
 
 The **opt-in tripartite hybrid aligner** (`munajjam/hybrid_aligner/`) was inspected,
@@ -97,7 +104,7 @@ run (no `HF_TOKEN`, no GPU, models not downloaded).
 | Token-table identity validated | PASS | `token_table_sha256` format validation |
 | Approval/access state validated | PASS | `approved` must be `True` |
 | `tokens.txt` requirements explicit | PASS | Docstring documents exact requirements |
-| phoneme-mapping requirements explicit | PASS | `phoneme_mapping_required` field + docstring |
+| phoneme-mapping requirements explicit | SUPERSEDED | The historical docstring named nonexistent `phonemes.txt`; see the 2026-10-05 correction at the top of this report and the artifact investigation. |
 | Malformed token IDs fail closed | PASS | OOV token → `InvalidProviderOutputError` |
 | Wrong blank IDs fail closed | PASS | Blank token in emissions → `InvalidProviderOutputError` |
 | Unsupported artifact formats fail closed | PASS | `feature_kind != "kaldi-fbank"` → ValueError |

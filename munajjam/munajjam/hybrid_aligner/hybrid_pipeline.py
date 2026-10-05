@@ -253,9 +253,10 @@ class HybridQuranAligner:
         warnings: list[str] = []
         if self.reference_aligner is not None:
             warnings.append(
-                "Zipformer emissions are not aligned to canonical text: the pinned, gated "
-                "artifact's quran_text2phoneme.json/ordered_quran_phonemes.json schema is "
-                "not available in this environment. No cross-vocabulary token mapping is inferred."
+                "Zipformer emissions are not aligned to canonical text: the pinned repository "
+                "contains quran_text2phoneme.json and ordered_quran_phonemes.json, but their "
+                "gated contents/schema are inaccessible in this environment. No cross-vocabulary "
+                "token mapping is inferred."
             )
         result = HybridAlignmentResult(
             groups,
@@ -276,7 +277,7 @@ class HybridQuranAligner:
                 ),
                 "zipformer_reference_alignment_completed": False,
                 "zipformer_reference_alignment_status": (
-                    "blocked_missing_gated_phoneme_map"
+                    "blocked_gated_artifact_access"
                     if self.reference_aligner is not None
                     else "not_configured"
                 ),

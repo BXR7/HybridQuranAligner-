@@ -226,13 +226,24 @@ validated final alignment
 
 The upstream [Issue #120 acceptance criteria](https://github.com/Itqan-community/Munajjam/issues/120)
 describe Zipformer as the **reference phoneme-alignment stage**, followed by Wav2Vec2
-microscopic forced alignment. The gated pinned artifact documents
-`quran_text2phoneme.json` and `ordered_quran_phonemes.json` as canonical phoneme resources,
-but their payload/schema is not accessible in this environment. Results therefore mark
-Zipformer emissions as **unaligned evidence** and expose a blocker in metadata; they do
-not claim canonical Zipformer alignment or evidence fusion. No mapping between the
+microscopic forced alignment. The pinned revision's public repository tree confirms that
+`quran_text2phoneme.json`, `ordered_quran_phonemes.json`, `phoneme_units.json`, and
+`tokens.txt` exist. The model card describes the first as an evaluation text-to-phoneme
+lookup, the second as canonical phonemization for all 6,236 ayat, and the third as the
+phoneme-unit inventory. The card also states that `tokens.txt` is the CTC symbol table
+and its IDs are offset from raw `phoneme_units.json` IDs (Zipformer blank is 250).
+However, the repository is manually gated: direct retrieval of all four files and the
+upstream evaluation/export scripts returns HTTP 401 in this environment. Results therefore
+mark Zipformer emissions as **unaligned evidence** and metadata says
+`blocked_gated_artifact_access`; they do not claim canonical Zipformer alignment or
+evidence fusion until the exact gated schemas are inspected. No mapping between the
 251-symbol Zipformer and 51-symbol Wav2Vec2 vocabularies is inferred. The exact remaining
-artifact requirements are recorded in [`docs/issue_120_external_sources.md`](docs/issue_120_external_sources.md).
+access and verification evidence is recorded in
+[`docs/issue_120_external_sources.md`](docs/issue_120_external_sources.md).
+An independent artifact investigation reached the same conclusion: the payloads are
+present at the pinned revision, but content access and real inference are blocked by the
+manual gate. See [`ISSUE120_ARTIFACT_INVESTIGATION.md`](ISSUE120_ARTIFACT_INVESTIGATION.md)
+for exact questions, hashes, interface notes, and verification results.
 
 For the pinned Zipformer model card at revision
 `506422c82a81c86e7ae74a5a2ab4641724bcd3b3`, the documented streaming grid is a 61-frame

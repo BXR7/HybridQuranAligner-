@@ -36,9 +36,12 @@ class ZipformerEvidence:
         - ``tokens.txt`` must contain exactly ``vocabulary_size`` ``piece id``
           entries.  Entries are parsed by their explicit integer ID rather
           than line position; the artifact includes ``<blank> 250``.
-        - When ``phoneme_mapping_required`` is ``True`, a ``phonemes.txt``
-          mapping file must accompany ``tokens.txt`` and map each token to its
-          IPA phoneme.  The mapping must not cross breath boundaries.
+        - When ``phoneme_mapping_required`` is ``True``, a schema-verified
+          canonical-target adapter must use the pinned
+          ``ordered_quran_phonemes.json`` or ``quran_text2phoneme.json`` with
+          ``phoneme_units.json`` and ``tokens.txt``. The pinned repository does
+          not list a separate ``phonemes.txt`` file. Never substitute token IDs
+          from another model's vocabulary.
         - The evidence contract does not require a particular device. The pinned ONNX
           backend requests CUDA then CPU through ONNX Runtime's provider fallback.
     """
